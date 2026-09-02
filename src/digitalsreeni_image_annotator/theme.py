@@ -35,9 +35,16 @@ from __future__ import annotations
 
 # Font stacks. Each entry is quoted for QSS and falls back to a generic
 # family so the app still renders sensibly on a machine with none of them.
+# Ordered by what each platform actually ships, best first. Inter leads
+# because where it is installed it is the closest match to the metrics
+# the rest of this sheet was tuned against; Segoe UI Variable Text is the
+# current Windows UI face and Segoe UI the older one; SF Pro Text covers
+# macOS. DejaVu Sans is last because it is wide and low-contrast — a
+# usable fallback, not a design target.
 UI_FONT_STACK = (
-    '"Segoe UI", "Inter", "SF Pro Text", "Ubuntu", "Cantarell", '
-    '"Helvetica Neue", Arial, sans-serif'
+    '"Inter", "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", '
+    '"Helvetica Neue", "Noto Sans", "Ubuntu", "Cantarell", '
+    '"DejaVu Sans", sans-serif'
 )
 # Numeric read-outs (zoom %, frame index, coordinates, counts) use a
 # monospaced stack so digits do not jitter as values change.
@@ -146,18 +153,43 @@ DARK_TOKENS = {
 # between themes — a control that is 26px tall in dark mode must be 26px
 # tall in light mode or the layout reflows when the user hits Ctrl+D.
 METRICS = {
-    "radius_control": "4px",
-    "radius_panel": "6px",
-    "radius_pill": "3px",
-    "control_height": "26px",
-    "control_pad": "4px 10px",
+    "radius_control": "6px",
+    "radius_panel": "10px",
+    "radius_pill": "5px",
+    "control_height": "28px",
+    "control_pad": "5px 12px",
 }
 
 
-def _fmt(template: str, tokens: dict) -> str:
+#: Point size the scale below is expressed against — the app's "Medium".
+BASE_POINT_SIZE = 10
+
+
+def type_scale(base_pt: int = BASE_POINT_SIZE) -> dict:
+    """Five sizes derived from one base, in px.
+
+    The Font Size menu used to be applied by appending
+    ``QWidget { font-size: Npt; }`` after the whole sheet and calling
+    setFont on every widget. Both of those flatten the hierarchy: a
+    heading, a button label and a help line all ended up the same size,
+    which is most of why the interface read as blocky. Sizes are derived
+    here instead, so changing Font Size scales the scale.
+    """
+    body = max(9, round(base_pt * 4 / 3))
+    return {
+        "fs_title": body + 2,
+        "fs_body": body,
+        "fs_label": body - 1,
+        "fs_small": body - 2,
+        "fs_micro": body - 3,
+    }
+
+
+def _fmt(template: str, tokens: dict, base_pt: int = BASE_POINT_SIZE) -> str:
     """Substitute ``{token}`` placeholders, failing loudly on typos."""
     values = dict(METRICS)
     values.update(tokens)
+    values.update({k: f"{v}px" for k, v in type_scale(base_pt).items()})
     values["ui_font"] = UI_FONT_STACK
     values["mono_font"] = MONO_FONT_STACK
     return template.format(**values)
@@ -245,21 +277,20 @@ QLabel {{
 
 QLabel.product-title {{
     color: {text};
-    font-size: 13px;
+    font-size: {fs_title};
     font-weight: 600;
 }}
 
 QLabel.product-subtitle,
 QLabel.muted {{
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel.eyebrow {{
-    color: {text_faint};
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1px;
+    color: {text_muted};
+    font-size: {fs_label};
+    font-weight: 600;
 }}
 
 QLabel.canvas-file {{
@@ -275,7 +306,7 @@ QLabel.mono {{
 QLabel.panel-count {{
     font-family: {mono_font};
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel.shortcut-pill {{
@@ -284,20 +315,20 @@ QLabel.shortcut-pill {{
     border: 1px solid {border};
     border-radius: {radius_pill};
     padding: 2px 6px;
-    font-size: 10px;
+    font-size: {fs_micro};
 }}
 
 QLabel.section-header,
 QLabel.dialog-title {{
     color: {text};
-    font-size: 14px;
+    font-size: {fs_title};
     font-weight: 600;
     padding: 2px 0;
 }}
 
 QLabel.help-text {{
-    color: {text_muted};
-    font-size: 11px;
+    color: {text_faint};
+    font-size: {fs_small};
 }}
 
 QLabel.workflow-hint,
@@ -308,7 +339,7 @@ QLabel[cardRole="notice"] {{
     border-radius: {radius_control};
     padding: 8px 10px;
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
     font-weight: 400;
 }}
 
@@ -318,7 +349,7 @@ QLabel[cardRole="info"] {{
     border-left: 2px solid {border_strong};
     padding: 2px 0 2px 8px;
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel[cardRole="status-idle"] {{
@@ -327,7 +358,7 @@ QLabel[cardRole="status-idle"] {{
     border-radius: {radius_control};
     padding: 5px 8px;
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel[cardRole="status-ok"] {{
@@ -336,7 +367,7 @@ QLabel[cardRole="status-ok"] {{
     border-radius: {radius_control};
     padding: 5px 8px;
     color: {success};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel[cardRole="status-warn"] {{
@@ -345,7 +376,7 @@ QLabel[cardRole="status-warn"] {{
     border-radius: {radius_control};
     padding: 5px 8px;
     color: {warning};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 /* --- Group boxes -------------------------------------------------- */
@@ -353,37 +384,37 @@ QLabel[cardRole="status-warn"] {{
 QGroupBox {{
     background-color: transparent;
     border: none;
-    border-top: 1px solid {divider};
-    margin-top: 14px;
-    padding-top: 6px;
-    font-size: 11px;
-    font-weight: 600;
+    margin-top: 18px;
+    padding-top: 4px;
+    font-size: {fs_label};
+    font-weight: 500;
 }}
 
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
     left: 0px;
-    padding: 0 6px 0 0;
-    color: {text_faint};
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1px;
+    padding: 0 0 4px 0;
+    color: {text_muted};
+    font-size: {fs_label};
+    font-weight: 600;
 }}
 
 /* --- Buttons ------------------------------------------------------ */
 
 QPushButton {{
-    background-color: {button_bg};
+    background-color: transparent;
     border: 1px solid {border_strong};
     border-radius: {radius_control};
     padding: {control_pad};
     min-height: {control_height};
     color: {text};
+    font-size: {fs_body};
 }}
 
 QPushButton:hover {{
-    background-color: {button_hover_bg};
+    background-color: {hover_bg};
+    border-color: {accent_border};
 }}
 
 QPushButton:pressed {{
@@ -526,11 +557,11 @@ QTabBar::tab {{
     background-color: transparent;
     border: none;
     border-bottom: 2px solid transparent;
-    padding: 6px 14px;
-    margin-right: 2px;
+    padding: 7px 2px;
+    margin-right: 18px;
     color: {text_muted};
-    font-size: 12px;
-    font-weight: 600;
+    font-size: {fs_body};
+    font-weight: 500;
 }}
 
 QTabBar::tab:hover {{
@@ -555,7 +586,7 @@ QTableWidget {{
 
 QListWidget::item,
 QTreeWidget::item {{
-    padding: 4px 6px;
+    padding: 6px 8px;
     border-radius: {radius_pill};
     color: {text};
 }}
@@ -582,7 +613,7 @@ QHeaderView::section {{
     border: none;
     border-bottom: 1px solid {border};
     padding: 4px 6px;
-    font-size: 11px;
+    font-size: {fs_small};
     font-weight: 600;
 }}
 
@@ -767,7 +798,7 @@ QStatusBar::item {{
 
 QStatusBar QLabel {{
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
     padding: 0 2px;
 }}
 
@@ -778,12 +809,12 @@ QLabel#statusSeparator {{
 QLabel.status-metric {{
     font-family: {mono_font};
     color: {text_muted};
-    font-size: 11px;
+    font-size: {fs_small};
 }}
 
 QLabel.status-strong {{
     color: {text};
-    font-size: 11px;
+    font-size: {fs_small};
     font-weight: 600;
 }}
 
@@ -793,7 +824,7 @@ QProgressBar {{
     border-radius: {radius_pill};
     text-align: center;
     color: {text_muted};
-    font-size: 10px;
+    font-size: {fs_micro};
     max-height: 14px;
 }}
 
@@ -853,9 +884,9 @@ QDialogButtonBox QPushButton {{
 """
 
 
-def build_stylesheet(tokens: dict) -> str:
-    """Render the QSS for one token table."""
-    return _fmt(_TEMPLATE, tokens)
+def build_stylesheet(tokens: dict, base_pt: int = BASE_POINT_SIZE) -> str:
+    """Render the QSS for one token table at one base font size."""
+    return _fmt(_TEMPLATE, tokens, base_pt)
 
 
 def tokens_for(dark_mode: bool) -> dict:

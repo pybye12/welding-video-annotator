@@ -258,6 +258,34 @@ which on Windows means barely-visible radio-button indicators and
 white-on-white headers (the dataset splitter radio buttons hit this
 before they were styled).
 
+## Type Scale and the Font Size Setting
+
+`theme.type_scale(base_pt)` derives five px sizes from one base, and
+`build_stylesheet(tokens, base_pt=...)` renders the sheet at that size.
+`apply_theme_and_font` passes the user's Font Size choice in, so changing
+it scales the whole hierarchy.
+
+Before this the setting was applied by appending
+`QWidget { font-size: Npt; }` to a fixed sheet. That rule is less
+specific than almost every other rule in the sheet, so it only reached
+widgets nothing else styled — headings, button labels and help text all
+came out the same size, which is most of why the interface read as
+blocky.
+
+**Do not remove the blanket rule or the per-widget font pass that follow
+the setStyleSheet call.** They look redundant beside the generated sheet.
+Removing them made the app segfault during Qt teardown: 6 runs out of 6
+under a real X server, against 0 out of 6 with them present, on
+otherwise identical code. The mechanism was never isolated. The comment
+in `apply_theme_and_font` says the same thing, because this is exactly
+the kind of tidy-up a later reader will attempt.
+
+Note also that the `offscreen` Qt platform plugin segfaults at teardown
+for this app regardless — 10 runs out of 10 on unmodified upstream — so
+process-exit assertions are only meaningful against a real X server.
+`tests/integration/test_app_lifecycle.py` skips itself without a DISPLAY
+for that reason.
+
 ## Frame Status and Session Progress
 
 `all_annotations[frame_name]` is the single source of truth for whether

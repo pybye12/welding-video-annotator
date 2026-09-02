@@ -114,7 +114,7 @@ from .snake_game import SnakeGame
 from .soft_dark_stylesheet import soft_dark_stylesheet
 from .annotation_history import AnnotationHistory
 from .shortcuts import ShortcutReferenceDialog
-from .theme import tokens_for
+from .theme import build_stylesheet, tokens_for
 from .stack_interpolator import StackInterpolator
 from .stack_to_slices import show_stack_to_slices
 from .utils import calculate_area, calculate_bbox
@@ -1703,7 +1703,7 @@ class ImageAnnotator(QMainWindow):
         )
         self.slice_list.itemClicked.connect(self.switch_slice)
         self.slice_list.setMaximumHeight(190)
-        self.slice_heading = QLabel("SLICES")
+        self.slice_heading = QLabel("Slices")
         self.slice_heading.setProperty("class", "eyebrow")
         # Inserted above "Clear Workspace" rather than appended, so the
         # destructive button stays at the bottom of the panel.
@@ -3476,7 +3476,7 @@ class ImageAnnotator(QMainWindow):
             widget.setAccessibleDescription(text)
 
         def group(title):
-            box = QGroupBox(title.upper())
+            box = QGroupBox(title)
             box_layout = QVBoxLayout(box)
             box_layout.setContentsMargins(0, 6, 0, 4)
             box_layout.setSpacing(6)
@@ -3536,7 +3536,7 @@ class ImageAnnotator(QMainWindow):
         self.workflow_hint.setWordWrap(True)
         labeling_layout.addWidget(self.workflow_hint)
 
-        data_group, data_layout = group("Start a labeling session")
+        data_group, data_layout = group("Session")
 
         self.import_format_selector = QComboBox()
         self.import_format_selector.addItem("COCO JSON")
@@ -3589,7 +3589,7 @@ class ImageAnnotator(QMainWindow):
 
         labeling_layout.addWidget(data_group)
 
-        class_group, class_layout = group("Label classes")
+        class_group, class_layout = group("Classes")
 
         self.class_list = QListWidget()
         self.class_list.setObjectName("classList")
@@ -3616,7 +3616,7 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(class_group)
 
-        display_group, display_group_layout = group("Make boundaries easier to see")
+        display_group, display_group_layout = group("Display")
         display_controls = QWidget()
         display_layout = QGridLayout(display_controls)
         display_layout.setContentsMargins(0, 0, 0, 0)
@@ -3672,7 +3672,7 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(display_group)
 
-        manual_group, manual_layout = group("Draw or correct a mask")
+        manual_group, manual_layout = group("Tools")
 
         self.polygon_button = QPushButton("Draw polygon")
         self.polygon_button.setCheckable(True)
@@ -3737,7 +3737,7 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(manual_group)
 
-        annotations_group, annotations_layout = group("Review this frame")
+        annotations_group, annotations_layout = group("This frame")
         self.annotation_list = QListWidget()
         self.annotation_list.setMinimumHeight(110)
         self.annotation_list.setMaximumHeight(150)
@@ -3771,7 +3771,7 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(annotations_group)
 
-        export_group, export_layout = group("Export and share")
+        export_group, export_layout = group("Export")
         self.export_format_selector = QComboBox()
         self.export_format_selector.addItem("COCO JSON")
         self.export_format_selector.addItem("YOLO (v4 and earlier)")
@@ -3813,9 +3813,8 @@ class ImageAnnotator(QMainWindow):
         self.ai_scroll, self.ai_page, ai_layout = scroll_page()
         self.sidebar_tabs.addTab(self.ai_scroll, "Auto-track")
         ai_workflow_hint = QLabel(
-            "TRACK ACROSS FRAMES\n"
-            "1  Draw one clean mask     2  Prepare frames\n"
-            "3  Track forward           4  Review every frame"
+            "TRACK ACROSS FRAMES  —  draw one clean mask, prepare the "
+            "frames, track forward, then review every frame."
         )
         ai_workflow_hint.setObjectName("aiWorkflowHint")
         ai_workflow_hint.setProperty("cardRole", "notice")
@@ -3825,7 +3824,7 @@ class ImageAnnotator(QMainWindow):
             help_text("AI masks are suggestions, not final labels. Check every frame.")
         )
 
-        sam2_group, sam2_layout = group("Improve one frame")
+        sam2_group, sam2_layout = group("Single frame")
         self.sam_model_selector = QComboBox()
         self.sam_model_selector.addItem("Pick a SAM Model")
         self.sam_model_selector.addItems(list(self.sam_utils.sam_models.keys()))
@@ -3848,7 +3847,7 @@ class ImageAnnotator(QMainWindow):
         )
         ai_layout.addWidget(sam2_group)
 
-        sam3_group, sam3_layout = group("Continue a mask through frames")
+        sam3_group, sam3_layout = group("Track through frames")
         sam3_scope = QLabel(
             "Tracks from the current frame to the end of the frames currently "
             "loaded in the Images list."
@@ -3897,7 +3896,7 @@ class ImageAnnotator(QMainWindow):
         )
         ai_layout.addWidget(sam3_group)
 
-        dino_group, dino_layout = group("Advanced: find objects from text")
+        dino_group, dino_layout = group("Find objects from text")
 
         self.dino_model_selector = QComboBox()
         self.dino_model_selector.addItem("Pick a DINO Model")
@@ -4742,17 +4741,28 @@ class ImageAnnotator(QMainWindow):
         self.apply_theme_and_font()
 
     def apply_theme_and_font(self):
+        """Render the sheet at the user's chosen base font size.
+
+        The sheet is now built *at* that size rather than having a
+        blanket ``QWidget { font-size: Npt; }`` appended to a fixed
+        sheet: appending one flattened the type scale, so headings,
+        button labels and help text all collapsed to a single size,
+        which is most of why the interface read as blocky. Sizes are
+        derived in theme.type_scale, so changing Font Size scales the
+        hierarchy instead of erasing it.
+
+        The blanket rule and the per-widget font pass below are kept even
+        so. They look redundant next to the generated sheet, and removing
+        them is tempting, but doing that made the app segfault during Qt
+        teardown — reproducibly, 6 runs out of 6 under a real X server,
+        against 0 out of 6 with them in place. The mechanism was never
+        pinned down; the measurement is unambiguous, so they stay, and
+        this comment exists so nobody quietly "cleans them up" again.
+        """
         font_size = self.font_sizes[self.current_font_size]
-        if self.dark_mode:
-            style = soft_dark_stylesheet
-        else:
-            style = default_stylesheet
+        style = build_stylesheet(tokens_for(self.dark_mode), base_pt=font_size)
+        self.setStyleSheet(f"{style}\nQWidget {{ font-size: {font_size}pt; }}")
 
-        # Combine the theme stylesheet with font size
-        combined_style = f"{style}\nQWidget {{ font-size: {font_size}pt; }}"
-        self.setStyleSheet(combined_style)
-
-        # Apply font size to all widgets
         for widget in self.findChildren(QWidget):
             font = widget.font()
             font.setPointSize(font_size)
@@ -4957,7 +4967,7 @@ class ImageAnnotator(QMainWindow):
         self.image_list_layout.setSpacing(6)
         self.main_splitter.addWidget(self.image_list_widget)
 
-        frames_heading = QLabel("FRAMES")
+        frames_heading = QLabel("Frames")
         frames_heading.setProperty("class", "eyebrow")
         self.frame_count_label = QLabel("0 loaded")
         self.frame_count_label.setProperty("class", "panel-count")
