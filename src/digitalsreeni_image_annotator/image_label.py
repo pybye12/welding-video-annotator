@@ -570,9 +570,13 @@ class ImageLabel(QLabel):
             painter.restore()
 
     def draw_tool_size_indicator(self, painter):
-        if self.current_tool in ["paint_brush", "eraser"] and hasattr(
-            self, "cursor_pos"
-        ):
+        # Guard the *value*, not the attribute. __init__ always sets
+        # cursor_pos, so `hasattr` was never False: arming the brush or
+        # eraser without the mouse having entered the canvas — clicking
+        # the sidebar button, or pressing B / E — left cursor_pos None and
+        # the next repaint raised TypeError inside paintEvent, which Qt
+        # turns into an abort.
+        if self.current_tool in ("paint_brush", "eraser") and self.cursor_pos:
             painter.save()
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.zoom_factor, self.zoom_factor)

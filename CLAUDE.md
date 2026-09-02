@@ -22,7 +22,7 @@ python -m src.digitalsreeni_image_annotator.main
 
 Python 3.10+ | PyQt6 6.7+ | Ultralytics 8.3.27 (SAM 2) | NumPy | OpenCV | Shapely
 
-**Test suite**: `tests/` (pytest + pytest-qt). 232 tests pass on PyQt6
+**Test suite**: `tests/` (pytest + pytest-qt). 236 tests pass on PyQt6
 (one SAM 3 test needs `torch` installed).
 
 ## Documentation
@@ -163,6 +163,8 @@ See [Runtime View](docs/06_runtime_view.md#multi-dimensional-image-loading) for 
 | Frame list rows | Marker via `setIcon`, never `setText` or a row background | `item.text()` and `findItems(name, MatchExactly)` are used in a dozen places; a row fill also collides with the selection color. |
 | Frame filtering | `setHidden`, never removing items | Keeps `count()`, `item(i)` and `findItems` seeing the whole project, so no existing caller needs to know about filtering. |
 | Any new keyboard shortcut | Bind the sequence **once**. Ctrl combos → `QAction` (add `setShortcutContext(ApplicationShortcut)` if it must work with focus elsewhere; alternates via `setShortcuts([...])`, de-duplicated). Plain keys → `_WorkflowKeyFilter` | A sequence bound by both a QAction and a QShortcut is ambiguous and Qt fires **neither** — measured with Ctrl+Z. `StandardKey.Redo` is Ctrl+Shift+Z on Linux/macOS but **Ctrl+Y on Windows**, so listing it next to a literal `"Ctrl+Y"` self-collides on Windows. Assert on the shortcut *count*, not membership. See [ADR-020](docs/09_architecture_decisions.md#adr-020-one-event-filter-for-plain-key-shortcuts). |
+| Painting anything from `cursor_pos` | Guard the value (`if self.cursor_pos:`), never `hasattr` | `__init__` always sets it, so `hasattr` is always True. A brush armed before the mouse entered the canvas left it `None` and the next `paintEvent` raised inside Qt, which aborts the process. |
+| Frame navigation | `setCurrentItem` is enough — it fires `currentRowChanged`, which is already wired to `switch_image` | Calling both loads the frame twice per keypress. |
 | Two-across button rows in the sidebar | Use the `side_by_side(...)` helper in `setup_sidebar` | Buttons report their full label as a minimum width and the sidebar scroll area has horizontal scrolling off, so a wide row is clipped at the right edge. The helper sets an explicit minimum so Qt elides instead. |
 
 ## Development Workflow

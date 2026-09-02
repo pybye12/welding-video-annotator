@@ -158,7 +158,7 @@ Press `Ctrl+/` in the app for the full list. The ones worth learning first:
 
 | Key | Action |
 |---|---|
-| `A` / `D` | Previous / next frame |
+| `A` / `D` | Previous / next frame (video clips and still-image projects alike) |
 | `C` | Copy the selected annotation to the next frame |
 | `P` / `R` / `B` / `E` | Polygon / box / paint brush / eraser |
 | `1` - `9` | Select label class by position in the list |

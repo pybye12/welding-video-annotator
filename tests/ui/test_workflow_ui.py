@@ -456,3 +456,79 @@ def test_panels_are_resizable_rather_than_pinned_to_fixed_widths(qtbot):
     assert window.main_splitter.indexOf(window.sidebar) == 0
     assert window.main_splitter.indexOf(window.image_widget) == 1
     assert window.main_splitter.indexOf(window.image_list_widget) == 2
+
+
+# --- Bugs found by clicking through the app ------------------------------
+
+
+def test_arming_the_brush_before_the_mouse_enters_the_canvas_does_not_crash(qtbot):
+    """paintEvent used to raise TypeError and Qt turned that into an abort.
+
+    The guard tested `hasattr(self, "cursor_pos")`, which __init__ always
+    satisfies. Clicking "Paint mask" (or pressing B) without having moved
+    the mouse over the canvas left cursor_pos None, and the next repaint
+    killed the app.
+    """
+    from PyQt6.QtGui import QPixmap, QPainter
+
+    window = _window(qtbot)
+    label = window.image_label
+    label.setPixmap(QPixmap(64, 64))
+    label.current_tool = "paint_brush"
+    label.cursor_pos = None
+
+    surface = QPixmap(64, 64)
+    painter = QPainter(surface)
+    try:
+        label.draw_tool_size_indicator(painter)  # must not raise
+    finally:
+        painter.end()
+
+
+def test_a_and_d_move_through_a_still_image_project(qtbot):
+    """A / D did nothing without a video sequence, which the UI advertises."""
+    window = _window(qtbot)
+    switched = []
+    window.switch_image = lambda item: switched.append(item.text())
+    _load_frames(window, ["a.png", "b.png", "c.png"])
+    window.image_list.setCurrentRow(0)
+
+    window.go_to_next_frame()
+    assert window.image_list.currentRow() == 1
+    window.go_to_next_frame()
+    assert window.image_list.currentRow() == 2
+    # Does not run off the end.
+    window.go_to_next_frame()
+    assert window.image_list.currentRow() == 2
+
+    window.go_to_previous_frame()
+    assert window.image_list.currentRow() == 1
+
+    # One load per keypress: setCurrentItem already triggers switch_image
+    # through currentRowChanged, so stepping must not call it again.
+    assert switched.count("c.png") == 1, switched
+
+
+def test_frame_stepping_skips_rows_hidden_by_the_filter(qtbot):
+    """The keys should walk what the annotator can actually see."""
+    window = _window(qtbot)
+    window.switch_image = lambda item: None
+    _load_frames(window, ["a.png", "skip.png", "c.png"])
+    window.image_list.item(1).setHidden(True)
+    window.image_list.setCurrentRow(0)
+
+    window.go_to_next_frame()
+
+    assert window.image_list.currentRow() == 2
+
+
+def test_enter_in_the_filter_box_returns_focus_to_the_canvas(qtbot):
+    """Otherwise every shortcut looks broken right after filtering."""
+    window = _window(qtbot)
+    window.switch_image = lambda item: None
+    _load_frames(window, ["a.png", "b.png"])
+    window.frame_filter_edit.setFocus()
+
+    window.frame_filter_edit.returnPressed.emit()
+
+    assert not window.frame_filter_edit.hasFocus()

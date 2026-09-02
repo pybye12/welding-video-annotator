@@ -4993,6 +4993,11 @@ class ImageAnnotator(QMainWindow):
             "Show only frames whose file name contains this text."
         )
         self.frame_filter_edit.textChanged.connect(self.apply_frame_filter)
+        # Enter hands focus back to the canvas. Without this the caret
+        # stays in the box after filtering, and A / D / P / 1-9 are all
+        # correctly treated as typing — so the keys look broken right
+        # after the most common reason to use the filter.
+        self.frame_filter_edit.returnPressed.connect(self._leave_frame_filter)
         self.unlabeled_only_button = QPushButton("Todo")
         self.unlabeled_only_button.setCheckable(True)
         self.unlabeled_only_button.setProperty("buttonRole", "ghost")
@@ -5278,6 +5283,18 @@ class ImageAnnotator(QMainWindow):
         self._update_frame_count_label()
         self.update_next_step_hint()
         self._sync_history_buttons()
+
+    def _leave_frame_filter(self):
+        """Return focus to the canvas so the shortcut keys work again."""
+        target = None
+        for index in range(self.image_list.count()):
+            if not self.image_list.item(index).isHidden():
+                target = self.image_list.item(index)
+                break
+        if target is not None and self.image_list.currentItem() is None:
+            self.image_list.setCurrentItem(target)
+            self.switch_image(target)
+        self.image_label.setFocus()
 
     def apply_frame_filter(self):
         """Hide frame rows that do not match the filter box or Todo toggle.
@@ -8439,16 +8456,45 @@ class ImageAnnotator(QMainWindow):
         if self._sam3_inference_in_flight:
             return
         if not self.frame_sequence:
+            self._step_through_image_list(1)
             return
         frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
         next_name = self.frame_sequence.name_for_index(frame_idx + 1) if frame_idx is not None else None
         if next_name:
             self._navigate_to_image_or_slice(next_name)
 
+    def _step_through_image_list(self, offset):
+        """Move through the frame list when there is no video sequence.
+
+        A / D previously did nothing at all for a project built from
+        still images, while the canvas header and the frames panel both
+        advertise them — so the app looked broken to anyone who had not
+        opened a video clip. Frames hidden by the filter are skipped, so
+        the keys walk what the annotator can actually see.
+        """
+        total = self.image_list.count()
+        if total == 0:
+            return
+        row = self.image_list.currentRow()
+        if row < 0:
+            row = 0 if offset > 0 else total - 1
+            target = row
+        else:
+            target = row + offset
+        while 0 <= target < total and self.image_list.item(target).isHidden():
+            target += offset
+        if not (0 <= target < total):
+            return
+        # setCurrentItem fires currentRowChanged, which is already wired
+        # to switch_image — calling it again here would load the frame
+        # twice on every keypress.
+        self.image_list.setCurrentItem(self.image_list.item(target))
+
     def go_to_previous_frame(self):
         if self._sam3_inference_in_flight:
             return
         if not self.frame_sequence:
+            self._step_through_image_list(-1)
             return
         frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
         previous_name = self.frame_sequence.name_for_index(frame_idx - 1) if frame_idx is not None else None
