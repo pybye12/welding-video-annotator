@@ -180,7 +180,22 @@ nothing visible" in v0.9.0 manual testing.
 
 ## Dark Mode Support
 
-### Stylesheet Switching
+### One Token Table, Two Stylesheets
+
+`theme.py` owns the palette. `LIGHT_TOKENS` and `DARK_TOKENS` hold the
+same keys; `build_stylesheet(tokens)` renders the QSS; and
+`default_stylesheet.py` / `soft_dark_stylesheet.py` are three-line
+modules that call it. Both sheets therefore style exactly the same
+selectors, always.
+
+```python
+# theme.py
+LIGHT_TOKENS = {"panel_bg": "#FFFFFF", "success": "#1A7F37", ...}
+DARK_TOKENS  = {"panel_bg": "#212427", "success": "#4CAF63", ...}
+
+# soft_dark_stylesheet.py
+soft_dark_stylesheet = build_stylesheet(DARK_TOKENS)
+```
 
 ```python
 # In ImageAnnotator
@@ -191,6 +206,28 @@ else:
     self.setStyleSheet(default_stylesheet)
     self.image_label.set_dark_mode(False)
 ```
+
+**Rules**
+
+- Add a token to **both** tables. `build_stylesheet` uses `str.format`,
+  so a key present in one table only raises `KeyError` at import time —
+  loud, and before anything renders.
+- Chrome that paints colours in Python — list-item markers, panel
+  decoration — reads `tokens_for(self.dark_mode)` instead of carrying
+  its own hex literals. `_apply_labeled_marker` is the example to copy.
+  The canvas overlays in `image_label.py` are deliberately *not* themed:
+  the polygon fills, the SAM point markers and the brush ring are read
+  against the welding footage, not against the interface, and their
+  colours are chosen for contrast with the image. Converting those is a
+  separate question from theming the shell.
+- `tests/unit/test_theme.py` asserts that the two tables share their
+  keys and that both sheets style the same selector set, so a
+  half-finished theme change fails CI rather than shipping a widget that
+  is only styled in one mode.
+
+Before this, the two sheets were hand-maintained strings. The dark one
+gained panel styling and button roles that the light one never got, so
+Ctrl+D dropped half the window back to raw Qt defaults.
 
 **Dark Mode Considerations**:
 - Annotation rendering uses inverted colors for visibility
@@ -220,6 +257,164 @@ the widget. Otherwise the widget uses the OS default in dark mode,
 which on Windows means barely-visible radio-button indicators and
 white-on-white headers (the dataset splitter radio buttons hit this
 before they were styled).
+
+## Type Scale and the Font Size Setting
+
+`theme.type_scale(base_pt)` derives five px sizes from one base, and
+`build_stylesheet(tokens, base_pt=...)` renders the sheet at that size.
+`apply_theme_and_font` passes the user's Font Size choice in, so changing
+it scales the whole hierarchy.
+
+Before this the setting was applied by appending
+`QWidget { font-size: Npt; }` to a fixed sheet. That rule is less
+specific than almost every other rule in the sheet, so it only reached
+widgets nothing else styled — headings, button labels and help text all
+came out the same size, which is most of why the interface read as
+blocky.
+
+**Do not remove the blanket rule or the per-widget font pass that follow
+the setStyleSheet call.** They look redundant beside the generated sheet.
+Removing them made the app segfault during Qt teardown: 6 runs out of 6
+under a real X server, against 0 out of 6 with them present, on
+otherwise identical code. The mechanism was never isolated. The comment
+in `apply_theme_and_font` says the same thing, because this is exactly
+the kind of tidy-up a later reader will attempt.
+
+Note also that the `offscreen` Qt platform plugin segfaults at teardown
+for this app regardless — 10 runs out of 10 on unmodified upstream — so
+process-exit assertions are only meaningful against a real X server.
+`tests/integration/test_app_lifecycle.py` skips itself without a DISPLAY
+for that reason.
+
+## Frame Status and Session Progress
+
+`all_annotations[frame_name]` is the single source of truth for whether
+a frame is finished. `frame_has_labels()` answers that question in one
+place, and deliberately ignores classes prefixed `Temp-`: those are
+model proposals waiting for review, so a frame holding only proposals is
+not done.
+
+Everything that reports progress derives from it:
+
+| Surface | Fed by |
+|---------|--------|
+| Marker dot on a frame or slice row | `_apply_labeled_marker` |
+| "N of M labeled (P%)" + progress bar | `refresh_frame_progress` |
+| Undo / redo button enablement | `_sync_history_buttons` |
+| "Todo" filter in the frames panel | `apply_frame_filter` |
+| Next-step line at the top of the Label tab | `update_next_step_hint` |
+
+`annotations_changed()` is the hook to call after label state changes.
+`update_slice_list_colors()` delegates to it, which is what lets the two
+dozen existing mutation paths keep their existing call and stay correct;
+new code should call `annotations_changed()` directly.
+
+**Refreshes coalesce, because bulk paths are per-frame.**
+`load_project_data` calls `add_images_to_list` once per image, and each
+of those switches image twice — so an uncoalesced O(all frames) refresh
+per call makes opening a project quadratic. Measured on 400 frames
+before coalescing: 11.5 s, scaling 3.2× for 2× the frames. Two guards
+fix it:
+
+- `suspended_progress_refresh()` — a context manager wrapping bulk
+  operations; `add_images_to_list` uses it. One refresh runs when the
+  outermost block exits.
+- `is_loading_project` suppresses refreshes outright, with a single
+  `annotations_changed()` after the load finishes.
+
+After both, the same 400-frame load takes 4.5 s — faster than the
+pre-change baseline, because the per-row slice-colour loop is now
+skipped during bulk work too.
+
+**Markers and counts are computed in one pass**, so a dot can never
+disagree with the number beside it. That is affordable because
+`_apply_labeled_marker` returns immediately for a row that already looks
+right: each row caches `(labeled, dark_mode)` in a custom item role, so a
+refresh over an unchanged list costs one dict lookup per row and zero
+`setIcon` calls. Caching the theme alongside the state is also what makes
+Ctrl+D re-colour every marker without a separate invalidation pass.
+
+`ImageLabel._notify_cursor` calls `update_cursor_readout`, not the whole
+status-bar rebuild — it runs on every mouse-move.
+
+**Markers are icons, never row colours.** The frame list is looked up by
+`item.text()` and `findItems(name, MatchExactly)` in more than a dozen
+places, so the marker has to stay out of the text; and a filled row
+colour competes with the stylesheet's own selection colour, which made a
+labeled row and the selected row indistinguishable.
+
+**Filtering hides rows, it never removes them.** `apply_frame_filter`
+calls `setHidden`, so `image_list.count()`, `item(index)` and
+`findItems` keep seeing the whole project and no existing caller has to
+learn about filtering. The frame currently on the canvas is always left
+visible — hiding it looks like the open frame vanished.
+
+## Undo/Redo — Snapshots, Not Inverse Commands
+
+`AnnotationHistory` (`annotation_history.py`) stores a deep copy of one
+frame's `{class: [annotation, ...]}` mapping before each edit.
+
+A dozen paths mutate annotations — polygon, rectangle, brush, eraser,
+delete, merge, class change, DINO accept, SAM 3 track. Writing a correct
+inverse for each is a large surface area, and a wrong inverse silently
+corrupts a labelled frame, which is worse than having no undo. A frame
+snapshot is a few hundred points at most in this workflow, and restoring
+it cannot desynchronise from the live state because it *is* the state.
+
+- Call `record_annotation_history("what changed")` **before** mutating.
+- History is per frame, so Ctrl+Z never rewrites a frame the annotator
+  is not looking at. Paths that write to a frame other than the one on
+  screen must pass that frame name explicitly — `_commit_dino_results`,
+  `copy_selected_annotation_to_next_frame` and the per-frame loop in
+  `sam3_track_forward` all do.
+- **History must die with the annotations it describes.** It is keyed by
+  bare frame name, and `undo_annotation_change` auto-saves, so a stale
+  entry can inject a closed project's annotations into a new project
+  that reuses a file name and write them to its `.iap`. `clear_all`,
+  `load_project_data` and `import_annotations` call
+  `annotation_history.clear()`; `_remove_image_item` calls `forget()`
+  for the frame and each of its slices.
+- `ImageLabel` reaches it through `_record_history`, which looks the
+  method up defensively — the unit tests drive `ImageLabel` with
+  lightweight stand-in main windows.
+
+## Keyboard Shortcuts — Bind Each Sequence Once
+
+Three mechanisms are in play, and mixing them wrongly silently breaks
+the binding:
+
+| Kind | Mechanism | Examples |
+|------|-----------|----------|
+| Menu commands | `QAction` with `setShortcut` | Ctrl+Z, Ctrl+S, Ctrl+D |
+| Plain keys needing global reach | Application-wide event filter | P R B E, 1-9 |
+| Legacy single keys | `QShortcut` (ApplicationShortcut) | A, D, C, F2 |
+
+**A sequence bound twice is ambiguous and Qt fires neither.** This was
+measured: with Ctrl+Z on both the Edit menu action and a `QShortcut`,
+pressing Ctrl+Z did nothing at all. Ctrl+Y is therefore a second
+sequence on the *same* redo action (`setShortcuts([...])`), not a
+separate shortcut object.
+
+Menu actions that must work while focus sits in the frame list or a tool
+panel need `setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)`
+— that is why the undo and redo actions set it.
+
+`_WorkflowKeyFilter` handles the unmodified tool and class keys. Its
+"is the user typing?" test inspects the widget the event was **delivered
+to**, not `QApplication.focusWidget()`: the focus widget is null
+whenever the window is not active, which would let a tool key steal a
+character out of the frame filter box.
+
+Beware platform-resolved standard keys: `StandardKey.Redo` is
+Ctrl+Shift+Z on Linux and macOS but **Ctrl+Y on Windows**, so listing it
+alongside a literal `"Ctrl+Y"` binds Ctrl+Y twice on Windows. Build such
+lists by de-duplicating, and assert on the count — a membership check
+cannot see a duplicate.
+
+The filter is also gated on `isActiveWindow()`: several child windows
+(help, the Snake easter egg, the YOLO training dialog) are shown
+non-modally, and without the gate a tool key aimed at one of them would
+act on the canvas behind it.
 
 ## Thread Safety for YOLO Training
 

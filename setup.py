@@ -10,7 +10,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="digitalsreeni-image-annotator",
-    version="0.9.0",  # PyQt6 + in-process inference
+    version="0.9.1",  # PyQt6 + in-process inference
     author="Dr. Sreenivas Bhattiprolu",
     author_email="digitalsreeni@gmail.com",
     description="A tool for annotating images using manual and automated tools, supporting multi-dimensional images and SAM2-assisted annotations",

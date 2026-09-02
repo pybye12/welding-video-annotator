@@ -480,6 +480,163 @@ SAM2, SAM3, EfficientTAM, and large-video workflows.
 
 ---
 
+## ADR-018: Generate Both Stylesheets from One Token Table
+
+**Status**: Accepted (v0.9.1)
+
+**Context**: `default_stylesheet.py` (light) and
+`soft_dark_stylesheet.py` (dark) were two hand-written QSS strings,
+389 and 483 lines. They drifted. The dark sheet grew panel surfaces,
+button roles (`primary` / `accent` / `quiet` / `danger` / `tool`),
+tab styling and status colours; the light sheet never got most of
+them, so Ctrl+D dropped half the window to raw Qt widget defaults.
+Every new widget had to be styled twice or it looked broken in one
+mode, and nothing failed when the second edit was forgotten.
+
+**Decision**: Move the palette into `theme.py` as two token tables
+with identical keys, plus `build_stylesheet(tokens)` which renders the
+QSS from one template. The two stylesheet modules become three-line
+wrappers that call it, keeping their existing module and variable
+names so no import changes.
+
+Rendering uses `str.format`, so a token missing from one table raises
+`KeyError` at import — the failure is immediate and obvious rather
+than a silently unstyled widget. `tests/unit/test_theme.py` also
+asserts the two tables share their keys and that both sheets emit the
+same selector set.
+
+Interface chrome that paints colours from Python reads
+`tokens_for(dark_mode)` rather than embedding hex literals, which is what
+removed the hardcoded list-row colours from `update_slice_list_colors`.
+Canvas overlay colours in `image_label.py` stay as they are: they are
+picked for contrast against welding footage rather than against the UI,
+so they are not a theming concern.
+
+**Consequences**:
+- ✅ Light and dark cannot diverge; a colour is written once.
+- ✅ A new widget needs one rule, not two.
+- ✅ Python-side colours (markers, overlays) follow the theme.
+- ⚠️ QSS is now generated, so it cannot be read straight off disk —
+  the file header points at `theme.py`.
+- ⚠️ Braces in the template must be doubled for `str.format`. The
+  test suite catches an unbalanced template immediately.
+
+**Related**: `theme.py`, [Cross-cutting Concepts → One Token Table,
+Two Stylesheets](08_crosscutting_concepts.md#one-token-table-two-stylesheets).
+
+---
+
+## ADR-019: Undo via Per-Frame Snapshots
+
+**Status**: Accepted (v0.9.1)
+
+**Context**: The app had no undo. A misplaced polygon, an eraser
+stroke that took out the wrong class, or an accepted batch of model
+proposals could only be repaired by hand, and annotators work through
+hundreds of frames per session. Two designs were considered:
+
+1. **Command log with inverse operations.** Smallest memory
+   footprint, but every one of the dozen mutation paths (polygon,
+   rectangle, brush, eraser, delete, merge, class change, SAM/DINO
+   accept, SAM 3 track) needs its own correct inverse. A wrong
+   inverse corrupts a labelled frame silently — worse than no undo.
+2. **Snapshot the frame's annotation mapping before each edit.**
+
+**Decision**: Option 2. `AnnotationHistory` keeps bounded per-frame
+undo and redo stacks of deep-copied `{class: [annotation, ...]}`
+mappings. Mutating paths call `record_annotation_history(label)`
+before they change anything.
+
+Per frame, not global: undo restores the frame it was recorded on, so
+switching frames and pressing Ctrl+Z cannot rewrite a frame the
+annotator is not looking at. Depth is capped (40) to bound memory
+across a long session.
+
+**Consequences**:
+- ✅ Correct by construction — the restored state *is* a state the
+  frame was previously in.
+- ✅ New mutation paths need one line, not an inverse operation.
+- ✅ Undo/redo restore is one code path (`_restore_annotation_state`),
+  so the annotation list, markers, progress and canvas always refresh
+  together.
+- ⚠️ Memory is proportional to depth × polygons per frame. Acceptable
+  here (hundreds of points per frame); would need revisiting for
+  dense instance segmentation with thousands of objects.
+- ⚠️ A mutation path that forgets to record is not undoable, and
+  nothing warns. Mitigated by keeping the call adjacent to the commit
+  in each path.
+
+**Related**: `annotation_history.py`, [Cross-cutting Concepts →
+Undo/Redo](08_crosscutting_concepts.md#undoredo--snapshots-not-inverse-commands).
+
+---
+
+## ADR-020: One Event Filter for Plain-Key Shortcuts
+
+**Status**: Accepted (v0.9.1)
+
+**Context**: Tool selection (P/R/B/E) and class selection (1-9) have
+to work while focus sits on the frame list, the class list or a
+button — none of which forward a plain key press to the canvas. The
+obvious implementation is one `QShortcut` per key with
+`ApplicationShortcut` context, matching how A/D/C and F2 are already
+registered.
+
+Two problems appeared:
+
+1. **Ambiguity.** Ctrl+Z was bound by both the Edit menu action and a
+   `QShortcut`. Qt treats a doubly-bound sequence as ambiguous and
+   fires neither — measured: Ctrl+Z did nothing at all.
+2. **Teardown instability.** While the per-key `QShortcut` version was
+   in place, constructing the window and letting the interpreter exit
+   segfaulted during Qt teardown on PyQt6 6.11 here, reproducibly, and
+   stopped once the digit shortcuts were removed or switched to
+   `WindowShortcut`. The root cause was never isolated, so treat this
+   as an observation rather than a proven mechanism — the ambiguity in
+   point 1 is on its own sufficient reason for the decision.
+
+**Decision**: Handle unmodified tool and class keys in a single
+application-wide event filter, `_WorkflowKeyFilter`, mirroring the
+existing `_DINOReviewEventFilter` (ADR-015). Ctrl combinations stay on
+their menu actions, with `ApplicationShortcut` context where they must
+work regardless of focus, and alternates such as Ctrl+Y added to the
+same action via `setShortcuts([...])` rather than a second object.
+
+The filter's "is the user typing?" test inspects the widget the event
+was **delivered to** rather than `QApplication.focusWidget()`, because
+the focus widget is null while the window is inactive — which would
+let a tool key steal a character out of the frame filter box.
+
+**Decision, part two — de-duplicate platform bindings.** Redo is
+reachable by Ctrl+Shift+Z and Ctrl+Y. `QKeySequence.StandardKey.Redo`
+resolves *per platform*: Ctrl+Shift+Z on Linux and macOS, **Ctrl+Y on
+Windows**. Listing `[StandardKey.Redo, "Ctrl+Y"]` therefore binds Ctrl+Y
+twice on Windows — reintroducing the exact ambiguity above, on the
+platform the lab runs. The action's sequences are built by appending
+candidates only if not already present, and
+`test_undo_and_redo_are_bound_once_so_the_shortcut_is_not_ambiguous`
+asserts on the *count*, since a membership check cannot see a duplicate.
+
+**Consequences**:
+- ✅ Every sequence is bound exactly once on every platform.
+- ✅ Tool and class keys work from any focused widget.
+- ✅ Text fields, spin boxes and modal dialogs keep their keystrokes.
+- ⚠️ A second global filter on top of ADR-015's. If a third appears,
+  collapse them as ADR-015 already recommends.
+- ⚠️ The legacy A/D/C/F2 `QShortcut`s were left alone to keep the
+  change small; they could fold into this filter later. They do at
+  least share the new `_typing_in_text_field` test.
+- ⚠️ The filter is gated on `isActiveWindow()`, because several child
+  windows (help, the Snake easter egg, the YOLO training dialog) are
+  shown non-modally; without the gate an "E" aimed at one of them would
+  arm the eraser on the canvas behind it.
+
+**Related**: `annotator_window.py` (`_WorkflowKeyFilter`,
+`handle_workflow_key`), [Cross-cutting Concepts → Keyboard
+Shortcuts](08_crosscutting_concepts.md#keyboard-shortcuts--bind-each-sequence-once).
+
+---
+
 ### Consider Relative Paths with Image Copying
 
 **Status**: Under Consideration

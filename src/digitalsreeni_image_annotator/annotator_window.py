@@ -7,6 +7,7 @@ import tempfile
 import traceback
 import uuid
 import warnings
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -30,12 +31,14 @@ from PyQt6.QtGui import (
     QIcon,
     QImage,
     QKeySequence,
+    QPainter,
     QPalette,
     QPixmap,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -60,9 +63,14 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,6 +112,9 @@ from .sam_utils import InferenceBusyError, SAMUtils, _run_sync
 from .slice_registration import SliceRegistrationTool
 from .snake_game import SnakeGame
 from .soft_dark_stylesheet import soft_dark_stylesheet
+from .annotation_history import AnnotationHistory
+from .shortcuts import ShortcutReferenceDialog
+from .theme import build_stylesheet, tokens_for
 from .stack_interpolator import StackInterpolator
 from .stack_to_slices import show_stack_to_slices
 from .utils import calculate_area, calculate_bbox
@@ -125,6 +136,21 @@ from .welding_defaults import (
 from .yolo_trainer import LoadPredictionModelDialog, TrainingInfoDialog, YOLOTrainer
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def redo_shortcut_sequences(standard_redo):
+    """Every sequence that should reach redo, with no duplicates.
+
+    ``standard_redo`` is the platform's own binding, passed in rather
+    than read here so a test can supply the Windows value (Ctrl+Y) on any
+    machine — which is the case that matters, since binding Ctrl+Y twice
+    makes Qt treat it as ambiguous and fire neither.
+    """
+    sequences = []
+    for candidate in (standard_redo, QKeySequence("Ctrl+Shift+Z"), QKeySequence("Ctrl+Y")):
+        if candidate not in sequences:
+            sequences.append(candidate)
+    return sequences
 
 
 def _canonical_image_name(name):
@@ -296,6 +322,49 @@ class _DINOReviewEventFilter(QObject):
         return True
 
 
+class _WorkflowKeyFilter(QObject):
+    """Application-wide handler for the unmodified tool and class keys.
+
+    P / R / B / E pick a drawing tool and 1-9 pick a label class. These
+    have to work while focus sits on the frame list, the class list or a
+    button — none of which forward a plain key press to the canvas — which
+    is the same reason A / D / C and F2 are registered globally.
+
+    Suppressed while a modal dialog is up, while the caret is in a text
+    field (so a filter box still accepts the literal character), and while
+    SAM 3 is mid-inference.
+    """
+
+    def __init__(self, main_window: "ImageAnnotator"):
+        super().__init__(main_window)
+        self.main_window = main_window
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.KeyPress:
+            return False
+        if event.modifiers() not in (
+            Qt.KeyboardModifier.NoModifier,
+            Qt.KeyboardModifier.KeypadModifier,
+        ):
+            return False
+        app = QApplication.instance()
+        if app is None or app.activeModalWidget() is not None:
+            return False
+        if not self.main_window.isEnabled():
+            return False
+        # Only when the main window is the one being typed into. Several
+        # child windows are shown non-modally (help, the Snake easter egg,
+        # the YOLO training dialog); without this an "E" aimed at one of
+        # them would silently arm the eraser on the canvas behind it.
+        if not self.main_window.isActiveWindow():
+            return False
+        # `obj` is the widget the key press was delivered to, i.e. the one
+        # with focus. Testing it directly is more reliable than asking the
+        # application for its focus widget, which is null whenever the
+        # window is not active — including under an offscreen/test server.
+        return self.main_window.handle_workflow_key(event.key(), obj)
+
+
 class ImageAnnotator(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -396,6 +465,18 @@ class ImageAnnotator(QMainWindow):
         # check would crash with AttributeError).
         self.dino_batch_results: dict[str, list] = {}
 
+        # Per-frame undo/redo over annotation snapshots. See
+        # annotation_history.py for why this snapshots rather than
+        # recording inverse commands.
+        self.annotation_history = AnnotationHistory()
+
+        # Progress-refresh coalescing. Bulk paths add frames one at a
+        # time, and a refresh walks the whole list, so without this the
+        # cost of opening a project is quadratic in frame count.
+        self._progress_refresh_depth = 0
+        self._progress_refresh_pending = False
+        self._hidden_frame_count = 0
+
         # Setup UI components
         self.setup_ui()
 
@@ -449,11 +530,11 @@ class ImageAnnotator(QMainWindow):
         # are pending review, and skips modal dialogs + text inputs.
         self._dino_review_filter = _DINOReviewEventFilter(self)
         QApplication.instance().installEventFilter(self._dino_review_filter)
-        
-        # Start in maximized mode
-        self.showMaximized()
 
-        # Start in maximized mode
+        self._install_workflow_shortcuts()
+        self.refresh_frame_progress()
+        self.update_status_bar()
+
         self.showMaximized()
 
     def setup_ui(self):
@@ -461,8 +542,18 @@ class ImageAnnotator(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
-        self.layout.setContentsMargins(10, 10, 10, 10)
-        self.layout.setSpacing(10)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(0)
+
+        # The three columns live in a splitter so the annotator can widen
+        # the frame list for long file names, or collapse the sidebar and
+        # give the whole window to the image. Fixed min/max widths alone
+        # meant the sidebar clipped its own buttons on smaller displays.
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        self.layout.addWidget(self.main_splitter)
 
         # Initialize tool group
         self.tool_group = QButtonGroup(self)
@@ -473,6 +564,14 @@ class ImageAnnotator(QMainWindow):
         self.setup_image_area()
         self.setup_image_list()
         self.setup_slice_list()
+        self.setup_status_bar()
+
+        # Canvas takes the slack; the two side panels keep their widths.
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([380, 1000, 260])
+
         self.update_ui_for_current_tool()
 
     def update_window_title(self):
@@ -485,6 +584,7 @@ class ImageAnnotator(QMainWindow):
             self.setWindowTitle(f"{base_title} - {project_name}")
         else:
             self.setWindowTitle(base_title)
+        self.update_project_identity()
 
     def new_project(self):
         if self._sam3_inference_in_flight:
@@ -650,6 +750,12 @@ class ImageAnnotator(QMainWindow):
 
                 self.initialize_yolo_trainer()
                 self.update_window_title()
+                # Progress refreshes are suppressed while
+                # is_loading_project is set (a project can hold thousands
+                # of frames, each added one at a time). Bring the frame
+                # markers, counters and filter up to date in one pass now
+                # that the whole project is in memory.
+                self.annotations_changed()
 
                 print(f"Project opened successfully: {project_file}")
                 QMessageBox.information(
@@ -660,6 +766,9 @@ class ImageAnnotator(QMainWindow):
 
             except Exception as e:
                 self.is_loading_project = False  # Make sure to clear flag on error
+                # Whatever state the half-loaded project left behind, the
+                # panels must describe it rather than the previous one.
+                self.annotations_changed()
                 raise e
         else:
             print(f"Project file not found: {project_file}")
@@ -708,6 +817,8 @@ class ImageAnnotator(QMainWindow):
 
         # Load all annotations first
         self.all_annotations.clear()
+        # Undo history belongs to the project that is being replaced.
+        self.annotation_history.clear()
         for image_info in project_data["images"]:
             if image_info.get("is_multi_slice", False):
                 for slice_info in image_info.get("slices", []):
@@ -817,14 +928,18 @@ class ImageAnnotator(QMainWindow):
             # Remove from image_paths
             self.image_paths.pop(image_name, None)
 
-            # Remove from all_annotations
+            # Remove from all_annotations, and the undo history with it —
+            # history is keyed by bare frame name and undo auto-saves, so
+            # a stale entry can write these annotations back later.
             self.all_annotations.pop(image_name, None)
+            self.annotation_history.forget(image_name)
 
             # If it's a multi-slice image, remove all related slices
             base_name = os.path.splitext(image_name)[0]
             if base_name in self.image_slices:
                 for slice_name, _ in self.image_slices[base_name]:
                     self.all_annotations.pop(slice_name, None)
+                    self.annotation_history.forget(slice_name)
                 del self.image_slices[base_name]
 
         self._prune_video_sessions_to_project_images()
@@ -906,8 +1021,8 @@ class ImageAnnotator(QMainWindow):
         self.image_list.clear()
         for image_info in self.all_images:
             self.image_list.addItem(image_info["file_name"])
-        if hasattr(self, "frame_count_label"):
-            self.frame_count_label.setText(f"{self.image_list.count()} loaded")
+        # Rebuilt rows carry no marker and no hidden state until this runs.
+        self.annotations_changed()
 
     def select_class(self, index):
         if 0 <= index < self.class_list.count():
@@ -1052,6 +1167,13 @@ class ImageAnnotator(QMainWindow):
                     self.current_project_dir = original_project_dir
                 elif hasattr(self, "current_project_dir"):
                     del self.current_project_dir
+
+        # The status bar is the only place that reports whether what is on
+        # screen has reached disk, so it has to hear about failures too.
+        self.set_saved_state(
+            saved,
+            "" if saved else "Save failed — check the project folder",
+        )
         return saved
 
     def _save_project_impl(self, show_message, created_destinations):
@@ -1557,6 +1679,7 @@ class ImageAnnotator(QMainWindow):
 
     def accept_sam_prediction(self):
         if self.image_label.temp_sam_prediction:
+            self.record_annotation_history("accepting a SAM mask")
             new_annotation = self.image_label.temp_sam_prediction
             self.image_label.annotations.setdefault(
                 new_annotation["category_name"], []
@@ -1573,9 +1696,21 @@ class ImageAnnotator(QMainWindow):
 
     def setup_slice_list(self):
         self.slice_list = QListWidget()
+        self.slice_list.setObjectName("sliceList")
+        self.slice_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.slice_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.slice_list.itemClicked.connect(self.switch_slice)
-        self.image_list_layout.addWidget(QLabel("Slices:"))
-        self.image_list_layout.addWidget(self.slice_list)
+        self.slice_list.setMaximumHeight(190)
+        self.slice_heading = QLabel("Slices")
+        self.slice_heading.setProperty("class", "eyebrow")
+        # Inserted above "Clear Workspace" rather than appended, so the
+        # destructive button stays at the bottom of the panel.
+        insert_at = self.image_list_layout.count() - 1
+        self.image_list_layout.insertWidget(insert_at, self.slice_heading)
+        self.image_list_layout.insertWidget(insert_at + 1, self.slice_list)
+        self._update_slice_panel_visibility()
 
     def open_images(self):
         file_names, _ = QFileDialog.getOpenFileNames(
@@ -1611,6 +1746,10 @@ class ImageAnnotator(QMainWindow):
         raise ValueError(f"Unsupported image shape: {image_array.shape}")
 
     def add_images_to_list(self, file_names, known_size=None, auto_save=True):
+        with self.suspended_progress_refresh():
+            return self._add_images_to_list(file_names, known_size, auto_save)
+
+    def _add_images_to_list(self, file_names, known_size, auto_save):
         first_added_item = None
         added_names = []
         existing_names = {
@@ -2185,32 +2324,14 @@ class ImageAnnotator(QMainWindow):
 
     def add_slice_to_list(self, slice_name):
         item = QListWidgetItem(slice_name)
-
-        if self.dark_mode:
-            # Dark mode
-            item.setBackground(
-                QColor(40, 40, 40)
-            )  # Very dark gray background for all items
-            if slice_name in self.all_annotations:
-                # Muted steel-blue + light text; the prior light-blue
-                # (173, 216, 230) bg + dark-gray text was painfully
-                # bright on a dark sidebar.
-                item.setForeground(QColor(235, 235, 235))
-                item.setBackground(QColor(58, 95, 140))
-            else:
-                item.setForeground(QColor(200, 200, 200))  # Light gray text
-        else:
-            # Light mode
-            item.setBackground(
-                QColor(240, 240, 240)
-            )  # Very light gray background for all items
-            if slice_name in self.all_annotations:
-                item.setForeground(QColor(255, 255, 255))  # White text
-                item.setBackground(QColor(70, 130, 180))  # Medium-dark blue background
-            else:
-                item.setForeground(QColor(0, 0, 0))  # Black text
-
+        # Marker via the shared helper so the two code paths that build
+        # this list cannot disagree about what a labeled slice looks like.
+        # Only this row is touched: a stack can produce thousands of
+        # slices, and re-scanning the whole project per row would make
+        # loading quadratic.
+        self._apply_labeled_marker(item, slice_name)
         self.slice_list.addItem(item)
+        self._update_slice_panel_visibility()
 
     def normalize_array(self, array):
         # print(f"Normalizing array. Shape: {array.shape}, dtype: {array.dtype}")
@@ -2280,14 +2401,8 @@ class ImageAnnotator(QMainWindow):
     def update_slice_list(self):
         self.slice_list.clear()
         for slice_name, _ in self.slices:
-            item = QListWidgetItem(slice_name)
-            if slice_name in self.all_annotations:
-                item.setForeground(QColor(Qt.GlobalColor.green))
-            else:
-                item.setForeground(
-                    QColor(Qt.GlobalColor.black) if not self.dark_mode else QColor(Qt.GlobalColor.white)
-                )
-            self.slice_list.addItem(item)
+            self.slice_list.addItem(QListWidgetItem(slice_name))
+        self.update_slice_list_colors()
 
         # Select the current slice
         if self.current_slice:
@@ -2299,6 +2414,7 @@ class ImageAnnotator(QMainWindow):
         self.slice_list.clear()
         self.slices = []
         self.current_slice = None
+        self._update_slice_panel_visibility()
 
     def reset_tool_buttons(self):
         for button in self.tool_group.buttons():
@@ -2361,8 +2477,14 @@ class ImageAnnotator(QMainWindow):
             super().keyPressEvent(event)
 
     def _trigger_video_shortcut(self, callback):
-        focused_widget = QApplication.focusWidget()
-        if isinstance(focused_widget, (QLineEdit, QTextEdit)):
+        # Text entry only. A non-editable QComboBox keeps focus after its
+        # popup closes, so including combo boxes here would silently stop
+        # A / D advancing frames for the rest of the session — combo
+        # type-ahead is protected in the event-filter path instead, where
+        # the key is genuinely being delivered to the combo.
+        if isinstance(
+            QApplication.focusWidget(), (QLineEdit, QTextEdit, QAbstractSpinBox)
+        ):
             return
         callback()
 
@@ -2876,50 +2998,69 @@ class ImageAnnotator(QMainWindow):
         self.annotation_list.repaint()
 
     def update_slice_list_colors(self):
-        # Set the background color of the entire list widget
-        if self.dark_mode:
-            self.slice_list.setStyleSheet(
-                "QListWidget { background-color: #0D1723; "
-                "border: 1px solid #26384E; border-radius: 8px; }"
+        """Kept as the name every existing mutation path already calls.
+
+        `annotations_changed()` is the real hook — use that in new code.
+        This delegates so the two dozen existing call sites keep working
+        without each one having to be edited.
+
+        Slices no longer get a filled row colour. The old hardcoded
+        steel-blue and light-blue fills were written per theme, ignored
+        the stylesheet's own selection colour, and made the selected row
+        indistinguishable from a labeled one. A marker dot carries the
+        same information and leaves the theme in charge.
+        """
+        self.annotations_changed()
+
+    #: Where a row caches the appearance it was last given, so a refresh
+    #: over thousands of rows only touches the ones that actually changed.
+    _MARKER_STATE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def _apply_labeled_marker(self, item, name, labeled=None):
+        """Give one list row its labeled / still-to-do appearance.
+
+        Returns immediately when the row already looks right, so a
+        refresh over an unchanged list costs one comparison per row and
+        no widget calls at all. The cached value carries the theme as
+        well as the label state, so toggling dark mode re-colours every
+        marker without a separate invalidation step.
+
+        ``labeled`` lets a caller that already computed the answer pass
+        it in rather than paying for the lookup twice.
+        """
+        if labeled is None:
+            labeled = self.frame_has_labels(name)
+        state = (labeled, self.dark_mode)
+        if item.data(self._MARKER_STATE_ROLE) == state:
+            return
+
+        tokens = tokens_for(self.dark_mode)
+        item.setIcon(
+            self._status_dot(
+                QColor(tokens["success"] if labeled else tokens["border_strong"])
             )
-        else:
-            self.slice_list.setStyleSheet(
-                "QListWidget { background-color: rgb(240, 240, 240); }"
-            )
+        )
+        item.setForeground(
+            QColor(tokens["text"] if labeled else tokens["text_muted"])
+        )
+        item.setBackground(QColor(Qt.GlobalColor.transparent))
+        item.setToolTip(
+            f"{name}\n{'Has labels' if labeled else 'No labels yet'}"
+        )
+        item.setData(self._MARKER_STATE_ROLE, state)
 
-        for i in range(self.slice_list.count()):
-            item = self.slice_list.item(i)
-            slice_name = item.text()
+    def _update_slice_panel_visibility(self):
+        """Hide the slice list unless the open image actually has slices.
 
-            if self.dark_mode:
-                # Dark mode (annotated colors match add_slice_to_list —
-                # muted steel-blue, light text; not the prior glaring
-                # light-blue bg)
-                if slice_name in self.all_annotations and any(
-                    self.all_annotations[slice_name].values()
-                ):
-                    item.setForeground(QColor(235, 235, 235))
-                    item.setBackground(QColor(58, 95, 140))
-                else:
-                    item.setForeground(QColor(200, 200, 200))  # Light gray text
-                    item.setBackground(QColor(13, 23, 35))
-            else:
-                # Light mode
-                if slice_name in self.all_annotations and any(
-                    self.all_annotations[slice_name].values()
-                ):
-                    item.setForeground(QColor(255, 255, 255))  # White text
-                    item.setBackground(
-                        QColor(70, 130, 180)
-                    )  # Medium-dark blue background
-                else:
-                    item.setForeground(QColor(0, 0, 0))  # Black text
-                    item.setBackground(
-                        QColor(240, 240, 240)
-                    )  # Very light gray background
-
-        # Force the list to repaint
-        self.slice_list.repaint()
+        Multi-dimensional stacks are the exception in this workflow, not
+        the rule, so an always-visible empty "Slices:" box just ate a
+        third of the frame panel for every video project.
+        """
+        if not hasattr(self, "slice_list") or not hasattr(self, "slice_heading"):
+            return
+        has_slices = self.slice_list.count() > 0
+        self.slice_heading.setVisible(has_slices)
+        self.slice_list.setVisible(has_slices)
 
     def update_annotation_list_colors(self, class_name=None, color=None):
         for i in range(self.annotation_list.count()):
@@ -3128,6 +3269,49 @@ class ImageAnnotator(QMainWindow):
         search_projects_action.triggered.connect(self.show_project_search)
         project_menu.addAction(search_projects_action)
 
+        # Edit Menu — undo lives here because that is the first place
+        # anyone looks for it.
+        edit_menu = menu_bar.addMenu("&Edit")
+
+        self.undo_action = QAction("&Undo Annotation Change", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        # Application context so Ctrl+Z still reaches the annotator while
+        # focus sits in the frame list, the class list or a tool panel.
+        self.undo_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.undo_action.triggered.connect(self.undo_annotation_change)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("&Redo Annotation Change", self)
+        # Ctrl+Shift+Z and Ctrl+Y both reach redo; people arrive from
+        # different editors. Both live on the one action so neither is
+        # bound twice — a sequence bound by an action *and* a QShortcut
+        # is ambiguous, and Qt then triggers neither.
+        #
+        # Built by de-duplicating rather than listing literally, because
+        # StandardKey.Redo resolves per platform: Ctrl+Shift+Z on Linux
+        # and macOS, but Ctrl+Y on Windows. A literal
+        # [StandardKey.Redo, "Ctrl+Y"] therefore binds Ctrl+Y twice on
+        # Windows — which is exactly the ambiguity this comment warns
+        # about, on the platform the lab actually runs.
+        self.redo_action.setShortcuts(
+            redo_shortcut_sequences(QKeySequence(QKeySequence.StandardKey.Redo))
+        )
+        self.redo_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.redo_action.triggered.connect(self.redo_annotation_change)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
+
+        edit_menu.addSeparator()
+
+        delete_annotations_action = QAction("&Delete Selected Annotations", self)
+        delete_annotations_action.triggered.connect(self.delete_selected_annotations)
+        edit_menu.addAction(delete_annotations_action)
+
         # Settings Menu
         settings_menu = menu_bar.addMenu("&Settings")
 
@@ -3141,6 +3325,11 @@ class ImageAnnotator(QMainWindow):
         toggle_dark_mode_action.setShortcut(QKeySequence("Ctrl+D"))
         toggle_dark_mode_action.triggered.connect(self.toggle_dark_mode)
         settings_menu.addAction(toggle_dark_mode_action)
+
+        fit_action = QAction("&Fit Frame to Window", self)
+        fit_action.setShortcut(QKeySequence("Ctrl+0"))
+        fit_action.triggered.connect(self.adjust_zoom_to_fit)
+        settings_menu.addAction(fit_action)
 
         # Tools Menu
         tools_menu = menu_bar.addMenu("&Tools")
@@ -3200,6 +3389,11 @@ class ImageAnnotator(QMainWindow):
         help_action.triggered.connect(self.show_help)
         help_menu.addAction(help_action)
 
+        shortcuts_action = QAction("&Keyboard Shortcuts", self)
+        shortcuts_action.setShortcut(QKeySequence("Ctrl+/"))
+        shortcuts_action.triggered.connect(self.show_shortcut_reference)
+        help_menu.addAction(shortcuts_action)
+
     def change_font_size(self, size):
         self.current_font_size = size
         self.apply_theme_and_font()
@@ -3241,24 +3435,32 @@ class ImageAnnotator(QMainWindow):
     def setup_sidebar(self):
         self.sidebar = QWidget()
         self.sidebar.setObjectName("controlPanel")
-        self.sidebar.setMinimumWidth(360)
-        self.sidebar.setMaximumWidth(450)
+        # Minimum sized so the widest two-button row still fits; the
+        # splitter lets the annotator go wider. Before this the panel was
+        # pinned at 360px and clipped "Open Video Clip..." off its right
+        # edge, with horizontal scrolling switched off.
+        self.sidebar.setMinimumWidth(340)
+        self.sidebar.setMaximumWidth(620)
         self.sidebar_layout = QVBoxLayout(self.sidebar)
-        self.sidebar_layout.setContentsMargins(12, 12, 12, 12)
-        self.sidebar_layout.setSpacing(10)
-        self.layout.addWidget(self.sidebar, 1)
+        self.sidebar_layout.setContentsMargins(10, 10, 10, 10)
+        self.sidebar_layout.setSpacing(8)
+        self.main_splitter.addWidget(self.sidebar)
 
+        # Project identity: what is open and whether it is saved. The
+        # previous header was a product name and tagline, which told the
+        # annotator nothing they did not already know.
         identity = QWidget()
         identity.setObjectName("productIdentity")
         identity_layout = QVBoxLayout(identity)
-        identity_layout.setContentsMargins(2, 0, 2, 4)
-        identity_layout.setSpacing(2)
-        product_title = QLabel("ANNOTATION STUDIO")
-        product_title.setProperty("class", "product-title")
-        product_subtitle = QLabel("Precise masks, frame by frame")
-        product_subtitle.setProperty("class", "product-subtitle")
-        identity_layout.addWidget(product_title)
-        identity_layout.addWidget(product_subtitle)
+        identity_layout.setContentsMargins(2, 0, 2, 2)
+        identity_layout.setSpacing(1)
+        self.project_name_label = QLabel("No project")
+        self.project_name_label.setProperty("class", "product-title")
+        self.project_meta_label = QLabel("Create or open a project to begin")
+        self.project_meta_label.setProperty("class", "product-subtitle")
+        self.project_meta_label.setWordWrap(True)
+        identity_layout.addWidget(self.project_name_label)
+        identity_layout.addWidget(self.project_meta_label)
         self.sidebar_layout.addWidget(identity)
 
         def help_text(text):
@@ -3276,15 +3478,33 @@ class ImageAnnotator(QMainWindow):
         def group(title):
             box = QGroupBox(title)
             box_layout = QVBoxLayout(box)
-            box_layout.setContentsMargins(8, 12, 8, 8)
+            box_layout.setContentsMargins(0, 6, 0, 4)
             box_layout.setSpacing(6)
             return box, box_layout
+
+        def side_by_side(*widgets):
+            """Lay widgets across one row without letting them overflow.
+
+            Buttons report their full label as a minimum width, and the
+            sidebar scroll area has horizontal scrolling switched off, so
+            a row wider than the panel used to be clipped at the right
+            edge — "Open Video Clip..." lost its last characters and
+            "Erase mask" disappeared entirely. An explicit minimum lets Qt
+            shrink and elide the label instead of overflowing; the full
+            text stays available in the tooltip.
+            """
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for widget in widgets:
+                widget.setMinimumWidth(1)
+                row.addWidget(widget, 1)
+            return row
 
         def scroll_page():
             page = QWidget()
             page_layout = QVBoxLayout(page)
-            page_layout.setContentsMargins(6, 6, 6, 6)
-            page_layout.setSpacing(8)
+            page_layout.setContentsMargins(2, 4, 6, 6)
+            page_layout.setSpacing(6)
 
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -3305,16 +3525,18 @@ class ImageAnnotator(QMainWindow):
         ) = scroll_page()
         self.sidebar_tabs.addTab(self.labeling_scroll, "Label")
 
-        workflow_hint = QLabel(
-            "YOUR WORKFLOW\n"
-            "Add frames  ->  choose a class  ->  draw  ->  review  ->  export"
-        )
-        workflow_hint.setObjectName("labelWorkflowHint")
-        workflow_hint.setProperty("class", "workflow-hint")
-        workflow_hint.setWordWrap(True)
-        labeling_layout.addWidget(workflow_hint)
+        # Replaces the static "YOUR WORKFLOW: add frames -> choose a class
+        # -> draw -> review -> export" banner. That text was correct on day
+        # one and dead weight from day two. This line reports the next
+        # useful action for the state the session is actually in, and is
+        # refreshed by update_next_step_hint().
+        self.workflow_hint = QLabel()
+        self.workflow_hint.setObjectName("labelWorkflowHint")
+        self.workflow_hint.setProperty("class", "workflow-hint")
+        self.workflow_hint.setWordWrap(True)
+        labeling_layout.addWidget(self.workflow_hint)
 
-        data_group, data_layout = group("Start a labeling session")
+        data_group, data_layout = group("Session")
 
         self.import_format_selector = QComboBox()
         self.import_format_selector.addItem("COCO JSON")
@@ -3329,10 +3551,9 @@ class ImageAnnotator(QMainWindow):
         self.import_button.setToolTip(
             "Import images together with existing COCO or YOLO labels."
         )
-        import_layout = QHBoxLayout()
-        import_layout.addWidget(self.import_format_selector, 1)
-        import_layout.addWidget(self.import_button, 1)
-        data_layout.addLayout(import_layout)
+        data_layout.addLayout(
+            side_by_side(self.import_format_selector, self.import_button)
+        )
 
         self.add_images_button = QPushButton("Add New Images")
         self.add_images_button.clicked.connect(self.add_images)
@@ -3344,12 +3565,10 @@ class ImageAnnotator(QMainWindow):
         self.open_video_button.setToolTip(
             "Load only a selected frame range from a large video."
         )
-        load_layout = QHBoxLayout()
-        load_layout.addWidget(self.add_images_button)
-        load_layout.addWidget(self.open_video_button)
-        data_layout.addLayout(load_layout)
+        data_layout.addLayout(
+            side_by_side(self.add_images_button, self.open_video_button)
+        )
 
-        preset_layout = QHBoxLayout()
         self.cavitar_preset_button = QPushButton("Droplets only")
         self.cavitar_preset_button.clicked.connect(
             self.add_cavitar_welding_classes
@@ -3364,36 +3583,53 @@ class ImageAnnotator(QMainWindow):
         self.full_arc_preset_button.setToolTip(
             "Add molten_consumable, droplet, external_arc, and internal_arc."
         )
-        preset_layout.addWidget(self.cavitar_preset_button)
-        preset_layout.addWidget(self.full_arc_preset_button)
-        data_layout.addLayout(preset_layout)
+        data_layout.addLayout(
+            side_by_side(self.cavitar_preset_button, self.full_arc_preset_button)
+        )
 
-        self.add_class_button = QPushButton("Add Custom Class")
-        self.add_class_button.clicked.connect(lambda: self.add_class())
-        self.add_class_button.setProperty("buttonRole", "quiet")
-        data_layout.addWidget(self.add_class_button)
+        labeling_layout.addWidget(data_group)
 
-        class_heading = QLabel("ACTIVE LABEL CLASS")
-        class_heading.setProperty("class", "eyebrow")
-        data_layout.addWidget(class_heading)
+        class_group, class_layout = group("Classes")
+
         self.class_list = QListWidget()
+        self.class_list.setObjectName("classList")
         self.class_list.setMinimumHeight(90)
         self.class_list.setMaximumHeight(120)
         self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         self.class_list.itemClicked.connect(self.on_class_selected)
         self.class_list.setToolTip(
-            "Select the class to assign before drawing an annotation."
+            "Select the class to assign before drawing an annotation. "
+            "Press 1-9 to switch class without leaving the canvas."
         )
-        data_layout.addWidget(self.class_list)
-        labeling_layout.addWidget(data_group)
+        class_layout.addWidget(self.class_list)
 
-        display_group, display_group_layout = group("Make boundaries easier to see")
+        self.add_class_button = QPushButton("Add Custom Class")
+        self.add_class_button.clicked.connect(lambda: self.add_class())
+        self.add_class_button.setProperty("buttonRole", "quiet")
+        class_layout.addWidget(self.add_class_button)
+        class_layout.addWidget(
+            help_text(
+                "Press 1-9 to switch class. Right-click a class to rename it, "
+                "recolour it, or delete it."
+            )
+        )
+        labeling_layout.addWidget(class_group)
+
+        display_group, display_group_layout = group("Display")
         display_controls = QWidget()
         display_layout = QGridLayout(display_controls)
         display_layout.setContentsMargins(0, 0, 0, 0)
+        display_layout.setHorizontalSpacing(8)
+        display_layout.setVerticalSpacing(4)
+        display_layout.setColumnStretch(1, 1)
 
         self.brightness_value_label = QLabel("+0")
+        self.brightness_value_label.setProperty("class", "mono")
+        self.brightness_value_label.setMinimumWidth(30)
+        self.brightness_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(-100, 100)
         self.brightness_slider.setValue(0)
@@ -3408,6 +3644,11 @@ class ImageAnnotator(QMainWindow):
         display_layout.addWidget(self.brightness_value_label, 0, 2)
 
         self.contrast_value_label = QLabel("+0")
+        self.contrast_value_label.setProperty("class", "mono")
+        self.contrast_value_label.setMinimumWidth(30)
+        self.contrast_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
         self.contrast_slider.setRange(-100, 100)
         self.contrast_slider.setValue(0)
@@ -3431,9 +3672,8 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(display_group)
 
-        manual_group, manual_layout = group("Draw or correct a mask")
+        manual_group, manual_layout = group("Tools")
 
-        button_layout_top = QHBoxLayout()
         self.polygon_button = QPushButton("Draw polygon")
         self.polygon_button.setCheckable(True)
         self.polygon_button.setProperty("buttonRole", "tool")
@@ -3448,10 +3688,7 @@ class ImageAnnotator(QMainWindow):
             self.rectangle_button,
             "Drag a rectangle around an object to create a box annotation.",
         )
-        button_layout_top.addWidget(self.polygon_button)
-        button_layout_top.addWidget(self.rectangle_button)
 
-        button_layout_bottom = QHBoxLayout()
         self.paint_brush_button = QPushButton("Paint mask")
         self.paint_brush_button.setCheckable(True)
         self.paint_brush_button.setProperty("buttonRole", "tool")
@@ -3467,21 +3704,40 @@ class ImageAnnotator(QMainWindow):
             self.eraser_button,
             "Remove pixels only from the selected class without changing other classes.",
         )
-        button_layout_bottom.addWidget(self.paint_brush_button)
-        button_layout_bottom.addWidget(self.eraser_button)
 
-        manual_layout.addLayout(button_layout_top)
-        manual_layout.addLayout(button_layout_bottom)
+        manual_layout.addLayout(
+            side_by_side(self.polygon_button, self.rectangle_button)
+        )
+        manual_layout.addLayout(
+            side_by_side(self.paint_brush_button, self.eraser_button)
+        )
+
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.clicked.connect(self.undo_annotation_change)
+        self.undo_button.setEnabled(False)
+        describe(
+            self.undo_button,
+            "Undo the last annotation change on this frame (Ctrl+Z).",
+        )
+        self.redo_button = QPushButton("Redo")
+        self.redo_button.clicked.connect(self.redo_annotation_change)
+        self.redo_button.setEnabled(False)
+        describe(
+            self.redo_button,
+            "Redo the annotation change you just undid (Ctrl+Shift+Z).",
+        )
+        manual_layout.addLayout(side_by_side(self.undo_button, self.redo_button))
+
         manual_layout.addWidget(
             help_text(
-                "Polygon: click around a boundary and press Enter. The eraser "
-                "changes only the selected class. Use - and = to change brush "
-                "or eraser size."
+                "Shortcuts: P polygon, R box, B paint, E erase, Esc cancel. "
+                "Polygon finishes on Enter. The eraser changes only the "
+                "selected class. Use - and = for brush size."
             )
         )
         labeling_layout.addWidget(manual_group)
 
-        annotations_group, annotations_layout = group("Review this frame")
+        annotations_group, annotations_layout = group("This frame")
         self.annotation_list = QListWidget()
         self.annotation_list.setMinimumHeight(110)
         self.annotation_list.setMaximumHeight(150)
@@ -3493,14 +3749,13 @@ class ImageAnnotator(QMainWindow):
         )
         annotations_layout.addWidget(self.annotation_list)
 
-        sort_button_layout = QHBoxLayout()
         self.sort_by_class_button = QPushButton("Sort by Class")
         self.sort_by_class_button.clicked.connect(self.sort_annotations_by_class)
-        sort_button_layout.addWidget(self.sort_by_class_button)
         self.sort_by_area_button = QPushButton("Sort by Area")
         self.sort_by_area_button.clicked.connect(self.sort_annotations_by_area)
-        sort_button_layout.addWidget(self.sort_by_area_button)
-        annotations_layout.addLayout(sort_button_layout)
+        annotations_layout.addLayout(
+            side_by_side(self.sort_by_class_button, self.sort_by_area_button)
+        )
 
         self.delete_button = QPushButton("Delete")
         self.delete_button.clicked.connect(self.delete_selected_annotations)
@@ -3509,14 +3764,14 @@ class ImageAnnotator(QMainWindow):
         self.merge_button.clicked.connect(self.merge_annotations)
         self.change_class_button = QPushButton("Change Class")
         self.change_class_button.clicked.connect(self.change_annotation_class)
-        edit_button_layout = QHBoxLayout()
-        edit_button_layout.addWidget(self.delete_button)
-        edit_button_layout.addWidget(self.merge_button)
-        edit_button_layout.addWidget(self.change_class_button)
-        annotations_layout.addLayout(edit_button_layout)
+        annotations_layout.addLayout(
+            side_by_side(
+                self.delete_button, self.merge_button, self.change_class_button
+            )
+        )
         labeling_layout.addWidget(annotations_group)
 
-        export_group, export_layout = group("Export and share")
+        export_group, export_layout = group("Export")
         self.export_format_selector = QComboBox()
         self.export_format_selector.addItem("COCO JSON")
         self.export_format_selector.addItem("YOLO (v4 and earlier)")
@@ -3558,8 +3813,8 @@ class ImageAnnotator(QMainWindow):
         self.ai_scroll, self.ai_page, ai_layout = scroll_page()
         self.sidebar_tabs.addTab(self.ai_scroll, "Auto-track")
         ai_workflow_hint = QLabel(
-            "TRACK ACROSS FRAMES\n"
-            "Draw one clean mask  ->  prepare frames  ->  track  ->  review"
+            "TRACK ACROSS FRAMES  —  draw one clean mask, prepare the "
+            "frames, track forward, then review every frame."
         )
         ai_workflow_hint.setObjectName("aiWorkflowHint")
         ai_workflow_hint.setProperty("cardRole", "notice")
@@ -3569,29 +3824,30 @@ class ImageAnnotator(QMainWindow):
             help_text("AI masks are suggestions, not final labels. Check every frame.")
         )
 
-        sam2_group, sam2_layout = group("Improve one frame")
+        sam2_group, sam2_layout = group("Single frame")
         self.sam_model_selector = QComboBox()
         self.sam_model_selector.addItem("Pick a SAM Model")
         self.sam_model_selector.addItems(list(self.sam_utils.sam_models.keys()))
         self.sam_model_selector.currentTextChanged.connect(self.change_sam_model)
         sam2_layout.addWidget(self.sam_model_selector)
 
-        sam_buttons_layout = QHBoxLayout()
         self.sam_box_button = QPushButton("Box Prompt")
         self.sam_box_button.setCheckable(True)
+        self.sam_box_button.setProperty("buttonRole", "tool")
         self.sam_box_button.clicked.connect(self.toggle_sam_box)
         self.sam_points_button = QPushButton("Point Prompts")
         self.sam_points_button.setCheckable(True)
+        self.sam_points_button.setProperty("buttonRole", "tool")
         self.sam_points_button.clicked.connect(self.toggle_sam_points)
-        sam_buttons_layout.addWidget(self.sam_box_button)
-        sam_buttons_layout.addWidget(self.sam_points_button)
-        sam2_layout.addLayout(sam_buttons_layout)
+        sam2_layout.addLayout(
+            side_by_side(self.sam_box_button, self.sam_points_button)
+        )
         sam2_layout.addWidget(
             help_text("Use a box or positive/negative points to segment one image.")
         )
         ai_layout.addWidget(sam2_group)
 
-        sam3_group, sam3_layout = group("Continue a mask through frames")
+        sam3_group, sam3_layout = group("Track through frames")
         sam3_scope = QLabel(
             "Tracks from the current frame to the end of the frames currently "
             "loaded in the Images list."
@@ -3640,7 +3896,7 @@ class ImageAnnotator(QMainWindow):
         )
         ai_layout.addWidget(sam3_group)
 
-        dino_group, dino_layout = group("Advanced: find objects from text")
+        dino_group, dino_layout = group("Find objects from text")
 
         self.dino_model_selector = QComboBox()
         self.dino_model_selector.addItem("Pick a DINO Model")
@@ -3656,9 +3912,11 @@ class ImageAnnotator(QMainWindow):
         dino_browse_layout.setContentsMargins(0, 0, 0, 0)
         self.lbl_dino_custom = QLabel("No path set")
         self.lbl_dino_custom.setWordWrap(True)
-        self.lbl_dino_custom.setStyleSheet("font-size:10px;color:#555;")
+        # Themed via the "help-text" class rather than a hardcoded
+        # "color:#555", which was invisible against the dark sidebar.
+        self.lbl_dino_custom.setProperty("class", "help-text")
         btn_dino_browse = QPushButton("Browse")
-        btn_dino_browse.setFixedWidth(60)
+        btn_dino_browse.setMinimumWidth(1)
         btn_dino_browse.clicked.connect(self.browse_dino_model)
         dino_browse_layout.addWidget(self.lbl_dino_custom, 1)
         dino_browse_layout.addWidget(btn_dino_browse)
@@ -3667,10 +3925,7 @@ class ImageAnnotator(QMainWindow):
 
         self.lbl_dino_status = QLabel("No DINO model loaded")
         self.lbl_dino_status.setWordWrap(True)
-        self.lbl_dino_status.setStyleSheet(
-            "font-size:11px;padding:4px;border-radius:3px;"
-            "border:1px solid palette(mid);"
-        )
+        self.lbl_dino_status.setProperty("cardRole", "status-idle")
         dino_layout.addWidget(self.lbl_dino_status)
 
         self.dino_class_table = ClassThresholdTable()
@@ -3680,17 +3935,16 @@ class ImageAnnotator(QMainWindow):
         self.dino_phrase_panel = PhraseEditorPanel()
         dino_layout.addWidget(self.dino_phrase_panel)
 
-        det_btn_layout = QHBoxLayout()
         self.btn_detect_single = QPushButton("Detect Current Image")
         self.btn_detect_single.clicked.connect(self.run_dino_detection_single)
         self.btn_detect_single.setEnabled(False)
-        det_btn_layout.addWidget(self.btn_detect_single)
 
         self.btn_detect_batch = QPushButton("Detect All Images")
         self.btn_detect_batch.clicked.connect(self.run_dino_detection_batch)
         self.btn_detect_batch.setEnabled(False)
-        det_btn_layout.addWidget(self.btn_detect_batch)
-        dino_layout.addLayout(det_btn_layout)
+        dino_layout.addLayout(
+            side_by_side(self.btn_detect_single, self.btn_detect_batch)
+        )
 
         # Batch mode
         self.dino_batch_mode = QComboBox()
@@ -4255,6 +4509,11 @@ class ImageAnnotator(QMainWindow):
         current_image = self.current_slice or self.image_file_name
         is_current = image_name == current_image
 
+        # Snapshot the frame this write lands on, not the frame on screen:
+        # the batch path commits into images the annotator is not looking
+        # at, and undo is keyed by frame.
+        self.record_annotation_history("accepting detections", image_name)
+
         if is_current:
             target = self.image_label.annotations
         else:
@@ -4417,6 +4676,10 @@ class ImageAnnotator(QMainWindow):
         if not self.image_label.temp_annotations:
             return
         image_name = self.current_slice or self.image_file_name
+        self.record_annotation_history(
+            f"accepting {len(self.image_label.temp_annotations)} detection(s)",
+            image_name,
+        )
 
         for ann in self.image_label.temp_annotations:
             class_name = ann["category_name"]
@@ -4478,17 +4741,28 @@ class ImageAnnotator(QMainWindow):
         self.apply_theme_and_font()
 
     def apply_theme_and_font(self):
+        """Render the sheet at the user's chosen base font size.
+
+        The sheet is now built *at* that size rather than having a
+        blanket ``QWidget { font-size: Npt; }`` appended to a fixed
+        sheet: appending one flattened the type scale, so headings,
+        button labels and help text all collapsed to a single size,
+        which is most of why the interface read as blocky. Sizes are
+        derived in theme.type_scale, so changing Font Size scales the
+        hierarchy instead of erasing it.
+
+        The blanket rule and the per-widget font pass below are kept even
+        so. They look redundant next to the generated sheet, and removing
+        them is tempting, but doing that made the app segfault during Qt
+        teardown — reproducibly, 6 runs out of 6 under a real X server,
+        against 0 out of 6 with them in place. The mechanism was never
+        pinned down; the measurement is unambiguous, so they stay, and
+        this comment exists so nobody quietly "cleans them up" again.
+        """
         font_size = self.font_sizes[self.current_font_size]
-        if self.dark_mode:
-            style = soft_dark_stylesheet
-        else:
-            style = default_stylesheet
+        style = build_stylesheet(tokens_for(self.dark_mode), base_pt=font_size)
+        self.setStyleSheet(f"{style}\nQWidget {{ font-size: {font_size}pt; }}")
 
-        # Combine the theme stylesheet with font size
-        combined_style = f"{style}\nQWidget {{ font-size: {font_size}pt; }}"
-        self.setStyleSheet(combined_style)
-
-        # Apply font size to all widgets
         for widget in self.findChildren(QWidget):
             font = widget.font()
             font.setPointSize(font_size)
@@ -4527,23 +4801,27 @@ class ImageAnnotator(QMainWindow):
         """Set up the central annotation canvas."""
         self.image_widget = QWidget()
         self.image_widget.setObjectName("canvasPanel")
+        self.image_widget.setMinimumWidth(320)
         self.image_layout = QVBoxLayout(self.image_widget)
         self.image_layout.setContentsMargins(0, 0, 0, 0)
-        self.image_layout.setSpacing(8)
-        self.layout.addWidget(self.image_widget, 3)
+        self.image_layout.setSpacing(0)
+        self.main_splitter.addWidget(self.image_widget)
 
         canvas_header = QWidget()
         canvas_header.setObjectName("canvasHeader")
         canvas_header_layout = QHBoxLayout(canvas_header)
-        canvas_header_layout.setContentsMargins(14, 8, 14, 8)
-        canvas_title = QLabel("CANVAS")
-        canvas_title.setProperty("class", "eyebrow")
-        self.canvas_file_label = QLabel("Add images to begin")
+        canvas_header_layout.setContentsMargins(12, 7, 12, 7)
+        canvas_header_layout.setSpacing(10)
+        self.canvas_file_label = QLabel("No frame loaded")
         self.canvas_file_label.setProperty("class", "canvas-file")
+        # Frame position sits next to the file name because "where am I in
+        # the clip" is the question an annotator asks most often.
+        self.canvas_position_label = QLabel("")
+        self.canvas_position_label.setProperty("class", "mono")
         shortcut_hint = QLabel("A / D  previous / next frame")
         shortcut_hint.setProperty("class", "shortcut-pill")
-        canvas_header_layout.addWidget(canvas_title)
         canvas_header_layout.addWidget(self.canvas_file_label)
+        canvas_header_layout.addWidget(self.canvas_position_label)
         canvas_header_layout.addStretch(1)
         canvas_header_layout.addWidget(shortcut_hint)
         self.image_layout.addWidget(canvas_header)
@@ -4560,46 +4838,136 @@ class ImageAnnotator(QMainWindow):
 
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area.setWidget(self.image_label)
-        self.image_layout.addWidget(self.scroll_area)
+
+        # With nothing loaded the canvas used to be an unexplained black
+        # rectangle taking two thirds of the window. The placeholder says
+        # what to do instead, and swaps out the moment a frame is open.
+        self.canvas_stack = QStackedWidget()
+        self.canvas_stack.addWidget(self._build_canvas_placeholder())
+        self.canvas_stack.addWidget(self.scroll_area)
+        self.image_layout.addWidget(self.canvas_stack, 1)
 
         canvas_footer = QWidget()
         canvas_footer.setObjectName("canvasFooter")
         footer_layout = QHBoxLayout(canvas_footer)
-        footer_layout.setContentsMargins(12, 6, 12, 6)
-        footer_layout.setSpacing(10)
-        zoom_label = QLabel("ZOOM")
-        zoom_label.setProperty("class", "eyebrow")
+        footer_layout.setContentsMargins(12, 5, 12, 5)
+        footer_layout.setSpacing(8)
+
+        self.zoom_fit_button = QPushButton("Fit")
+        self.zoom_fit_button.setProperty("buttonRole", "ghost")
+        self.zoom_fit_button.setToolTip("Scale the frame to fit the viewport.")
+        self.zoom_fit_button.clicked.connect(self.adjust_zoom_to_fit)
+        self.zoom_actual_button = QPushButton("1:1")
+        self.zoom_actual_button.setProperty("buttonRole", "ghost")
+        self.zoom_actual_button.setToolTip(
+            "Show the frame at one screen pixel per image pixel."
+        )
+        self.zoom_actual_button.clicked.connect(lambda: self.zoom_slider.setValue(100))
+
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setMinimum(10)
         self.zoom_slider.setMaximum(500)
         self.zoom_slider.setValue(100)
+        self.zoom_slider.setMaximumWidth(220)
         self.zoom_slider.valueChanged.connect(self.zoom_image)
         self.zoom_value_label = QLabel("100%")
         self.zoom_value_label.setObjectName("zoomValueLabel")
+        self.zoom_value_label.setProperty("class", "mono")
+        self.zoom_value_label.setMinimumWidth(42)
         self.zoom_slider.valueChanged.connect(
             lambda value: self.zoom_value_label.setText(f"{value}%")
         )
         self.image_info_label = QLabel()
-        self.image_info_label.setProperty("class", "muted")
-        footer_layout.addWidget(zoom_label)
-        footer_layout.addWidget(self.zoom_slider, 1)
+        self.image_info_label.setProperty("class", "mono")
+
+        footer_layout.addWidget(self.zoom_fit_button)
+        footer_layout.addWidget(self.zoom_actual_button)
+        footer_layout.addWidget(self.zoom_slider)
         footer_layout.addWidget(self.zoom_value_label)
-        footer_layout.addSpacing(12)
+        footer_layout.addStretch(1)
         footer_layout.addWidget(self.image_info_label)
         self.image_layout.addWidget(canvas_footer)
+
+    def _build_canvas_placeholder(self):
+        """What the canvas shows before any frame is open."""
+        placeholder = QWidget()
+        placeholder.setObjectName("canvasPlaceholder")
+        outer = QVBoxLayout(placeholder)
+        outer.setContentsMargins(40, 40, 40, 40)
+        outer.addStretch(1)
+
+        # The content sits in a fixed-width column. A word-wrapped label
+        # placed straight into a stretch-padded layout has no definite
+        # width to wrap against and collapses on top of its neighbour.
+        column = QWidget()
+        column.setObjectName("canvasPlaceholderColumn")
+        # Maximum, not fixed: QStackedWidget takes the widest page as its
+        # minimum size hint, so a fixed width here would put a permanent
+        # floor under the whole window even once a frame is loaded and
+        # this page is never shown again.
+        column.setMaximumWidth(480)
+        column_layout = QVBoxLayout(column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(10)
+
+        heading = QLabel("No frames loaded")
+        heading.setProperty("class", "section-header")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column_layout.addWidget(heading)
+
+        body = QLabel(
+            "Pull a frame range out of a recording, or add stills that are "
+            "already on disk. Save the project first and labels are written "
+            "to the .iap file as you work."
+        )
+        body.setProperty("class", "help-text")
+        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body.setWordWrap(True)
+        column_layout.addWidget(body)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        placeholder_video = QPushButton("Open Video Clip...")
+        placeholder_video.setProperty("buttonRole", "primary")
+        placeholder_video.clicked.connect(self.open_video_clip)
+        placeholder_images = QPushButton("Add New Images")
+        placeholder_images.clicked.connect(self.add_images)
+        placeholder_folder = QPushButton("Open Frame Folder...")
+        placeholder_folder.clicked.connect(self.open_frame_folder)
+        for button in (placeholder_video, placeholder_images, placeholder_folder):
+            button.setMinimumWidth(1)
+            actions.addWidget(button, 1)
+        column_layout.addSpacing(4)
+        column_layout.addLayout(actions)
+
+        hint = QLabel("Ctrl+/  lists every keyboard shortcut")
+        hint.setProperty("class", "shortcut-pill")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column_layout.addSpacing(10)
+        column_layout.addWidget(hint, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        outer.addWidget(column, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addStretch(1)
+        return placeholder
+
+    def _update_canvas_placeholder(self):
+        """Show the canvas only once there is something to draw on."""
+        if not hasattr(self, "canvas_stack"):
+            return
+        self.canvas_stack.setCurrentIndex(1 if self.current_image else 0)
 
     def setup_image_list(self):
         """Set up the frame navigator."""
         self.image_list_widget = QWidget()
         self.image_list_widget.setObjectName("framesPanel")
-        self.image_list_widget.setMinimumWidth(230)
-        self.image_list_widget.setMaximumWidth(330)
+        self.image_list_widget.setMinimumWidth(220)
+        self.image_list_widget.setMaximumWidth(460)
         self.image_list_layout = QVBoxLayout(self.image_list_widget)
-        self.image_list_layout.setContentsMargins(12, 12, 12, 12)
-        self.image_list_layout.setSpacing(8)
-        self.layout.addWidget(self.image_list_widget, 1)
+        self.image_list_layout.setContentsMargins(10, 10, 10, 10)
+        self.image_list_layout.setSpacing(6)
+        self.main_splitter.addWidget(self.image_list_widget)
 
-        frames_heading = QLabel("FRAMES")
+        frames_heading = QLabel("Frames")
         frames_heading.setProperty("class", "eyebrow")
         self.frame_count_label = QLabel("0 loaded")
         self.frame_count_label.setProperty("class", "panel-count")
@@ -4609,25 +4977,646 @@ class ImageAnnotator(QMainWindow):
         heading_row.addWidget(self.frame_count_label)
         self.image_list_layout.addLayout(heading_row)
 
-        frames_help = QLabel("Choose a frame to label. Use A and D to move quickly.")
-        frames_help.setWordWrap(True)
-        frames_help.setProperty("class", "help-text")
-        self.image_list_layout.addWidget(frames_help)
+        # Labeling a clip is a long job, so the panel reports how much of
+        # it is done. Without this the only way to tell was to click every
+        # frame in turn.
+        self.frame_progress = QProgressBar()
+        self.frame_progress.setObjectName("frameProgress")
+        self.frame_progress.setTextVisible(False)
+        self.frame_progress.setRange(0, 100)
+        self.frame_progress.setValue(0)
+        self.image_list_layout.addWidget(self.frame_progress)
+
+        self.frame_progress_label = QLabel("No frames loaded")
+        self.frame_progress_label.setProperty("class", "help-text")
+        self.image_list_layout.addWidget(self.frame_progress_label)
+
+        filter_row = QWidget()
+        filter_row.setObjectName("framesToolbar")
+        filter_layout = QHBoxLayout(filter_row)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(6)
+        self.frame_filter_edit = QLineEdit()
+        self.frame_filter_edit.setPlaceholderText("Filter frames...")
+        self.frame_filter_edit.setClearButtonEnabled(True)
+        self.frame_filter_edit.setToolTip(
+            "Show only frames whose file name contains this text."
+        )
+        self.frame_filter_edit.textChanged.connect(self.apply_frame_filter)
+        # Enter hands focus back to the canvas. Without this the caret
+        # stays in the box after filtering, and A / D / P / 1-9 are all
+        # correctly treated as typing — so the keys look broken right
+        # after the most common reason to use the filter.
+        self.frame_filter_edit.returnPressed.connect(self._leave_frame_filter)
+        self.unlabeled_only_button = QPushButton("Todo")
+        self.unlabeled_only_button.setCheckable(True)
+        self.unlabeled_only_button.setProperty("buttonRole", "ghost")
+        self.unlabeled_only_button.setToolTip(
+            "Show only frames that have no labels yet — the queue of work left."
+        )
+        self.unlabeled_only_button.toggled.connect(lambda _: self.apply_frame_filter())
+        filter_layout.addWidget(self.frame_filter_edit, 1)
+        filter_layout.addWidget(self.unlabeled_only_button)
+        self.image_list_layout.addWidget(filter_row)
 
         self.image_list = QListWidget()
         self.image_list.setObjectName("frameList")
+        # Frame file names are long and repetitive; elide the middle so the
+        # sequence number at the end stays readable and the list never
+        # grows a horizontal scrollbar.
+        self.image_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.image_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.image_list.setUniformItemSizes(True)
         self.image_list.itemClicked.connect(self.switch_image)
         self.image_list.currentRowChanged.connect(
             lambda row: self.switch_image(self.image_list.currentItem())
         )
         self.image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.image_list.customContextMenuRequested.connect(self.show_image_context_menu)
-        self.image_list_layout.addWidget(self.image_list)
+        self.image_list.setToolTip(
+            "Frames in this project. A filled marker means the frame has labels."
+        )
+        self.image_list_layout.addWidget(self.image_list, 1)
 
         self.clear_all_button = QPushButton("Clear Workspace")
         self.clear_all_button.clicked.connect(self.clear_all)
         self.clear_all_button.setProperty("buttonRole", "danger")
         self.image_list_layout.addWidget(self.clear_all_button)
+
+    # ------------------------------------------------------------------
+    # Session status: progress, filtering, the status bar and undo.
+    # ------------------------------------------------------------------
+
+    def setup_status_bar(self):
+        """A single line of live session state along the bottom edge.
+
+        Tool, class, cursor position and save state were previously only
+        discoverable by looking at four different places in the sidebar,
+        or not at all. Acquisition and annotation software puts them on
+        one status line because the annotator's eyes are on the image.
+        """
+        status = QStatusBar()
+        status.setSizeGripEnabled(False)
+        self.setStatusBar(status)
+
+        def metric(text="", strong=False):
+            label = QLabel(text)
+            label.setProperty(
+                "class", "status-strong" if strong else "status-metric"
+            )
+            return label
+
+        def separator():
+            label = QLabel("|")
+            label.setObjectName("statusSeparator")
+            return label
+
+        self.status_tool_label = metric("No tool", strong=True)
+        self.status_class_label = metric("No class")
+        self.status_cursor_label = metric("x -, y -")
+        self.status_brush_label = metric("")
+        self.status_save_label = metric("Not saved yet")
+
+        status.addWidget(self.status_tool_label)
+        status.addWidget(separator())
+        status.addWidget(self.status_class_label)
+        status.addWidget(separator())
+        status.addWidget(self.status_cursor_label)
+        status.addWidget(self.status_brush_label)
+        status.addPermanentWidget(self.status_save_label)
+
+    def update_cursor_readout(self, cursor_pos):
+        """Update only the coordinate field.
+
+        Called from every mouse-move over the canvas, so it deliberately
+        does not rebuild the rest of the status line.
+        """
+        if not hasattr(self, "status_cursor_label"):
+            return
+        text = (
+            f"x {int(cursor_pos[0]):>5}, y {int(cursor_pos[1]):>5}"
+            if cursor_pos
+            else "x     -, y     -"
+        )
+        if text != self.status_cursor_label.text():
+            self.status_cursor_label.setText(text)
+
+    def update_status_bar(self, cursor_pos=None):
+        """Refresh the status line. Safe to call before the bar exists."""
+        if not hasattr(self, "status_tool_label"):
+            return
+
+        tool_names = {
+            "polygon": "Polygon",
+            "rectangle": "Box",
+            "paint_brush": "Paint brush",
+            "eraser": "Eraser",
+            "sam_box": "SAM box prompt",
+            "sam_points": "SAM point prompts",
+        }
+        tool = getattr(self.image_label, "current_tool", None)
+        self.status_tool_label.setText(tool_names.get(tool, "No tool"))
+
+        if self.current_class:
+            self.status_class_label.setText(f"Class: {self.current_class}")
+        else:
+            self.status_class_label.setText("No class selected")
+
+        if cursor_pos is None:
+            cursor_pos = getattr(self.image_label, "cursor_pos", None)
+        self.update_cursor_readout(cursor_pos)
+
+        if tool == "paint_brush":
+            self.status_brush_label.setText(f"| brush {self.paint_brush_size} px")
+        elif tool == "eraser":
+            self.status_brush_label.setText(f"| eraser {self.eraser_size} px")
+        else:
+            self.status_brush_label.setText("")
+
+    def set_saved_state(self, saved: bool, detail: str = ""):
+        """Record whether the project on disk matches what is on screen."""
+        if not hasattr(self, "status_save_label"):
+            return
+        if not hasattr(self, "current_project_file"):
+            self.status_save_label.setText("No project — nothing is being saved")
+            return
+        if saved:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self.status_save_label.setText(detail or f"Saved {stamp}")
+        else:
+            self.status_save_label.setText(detail or "Unsaved changes")
+
+    def frame_has_labels(self, frame_name) -> bool:
+        """True when a frame carries at least one committed annotation.
+
+        ``Temp-`` classes are model proposals awaiting review, so a frame
+        holding only those is not finished and must not count as done.
+        """
+        classes = self.all_annotations.get(frame_name) or {}
+        return any(
+            annotations
+            for class_name, annotations in classes.items()
+            if not str(class_name).startswith("Temp-")
+        )
+
+    def _status_dot(self, color: QColor) -> QIcon:
+        """A small filled circle used as the labeled/unlabeled marker.
+
+        Drawn rather than set as an item background: the frame list is
+        looked up by ``item.text()`` and ``findItems`` in a dozen places,
+        so the marker has to live outside the text, and a full-row colour
+        fill fights the theme's own selection colours.
+        """
+        key = color.name()
+        cache = getattr(self, "_status_dot_cache", None)
+        if cache is None:
+            cache = self._status_dot_cache = {}
+        if key not in cache:
+            pixmap = QPixmap(10, 10)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(1, 1, 8, 8)
+            painter.end()
+            cache[key] = QIcon(pixmap)
+        return cache[key]
+
+    @contextmanager
+    def suspended_progress_refresh(self):
+        """Collapse many progress refreshes into one.
+
+        Bulk paths add frames one at a time — ``load_project_data`` calls
+        ``add_images_to_list`` once per image, and each of those switches
+        image twice. Each refresh walks the whole list, so without this
+        the cost of opening a project is quadratic in frame count. One
+        refresh runs when the outermost block exits.
+        """
+        self._progress_refresh_depth += 1
+        try:
+            yield
+        finally:
+            self._progress_refresh_depth -= 1
+            if self._progress_refresh_depth == 0 and self._progress_refresh_pending:
+                self._progress_refresh_pending = False
+                # Full refresh, not just the counters: a suspended block
+                # may have changed label state, and the markers and filter
+                # have to catch up with it.
+                self.annotations_changed()
+
+    def _defer_refresh(self) -> bool:
+        """Record that a refresh is owed, when one cannot run right now.
+
+        Named as a command because it mutates: callers read it as "should
+        I skip, and if so, remember that I did".
+        """
+        if self._progress_refresh_depth > 0 or self.is_loading_project:
+            self._progress_refresh_pending = True
+            return True
+        return False
+
+    def annotations_changed(self):
+        """Call after annotations are added or removed. Full refresh.
+
+        Walks every frame, so this belongs to *mutation* paths only.
+        Navigation calls ``refresh_session_status()`` instead, which does
+        no per-frame work — switching frames in a 2000-frame clip must
+        not pay for a whole-project scan.
+        """
+        self._update_slice_panel_visibility()
+        if self._defer_refresh():
+            return
+        self._progress_refresh_pending = False
+        self.apply_frame_filter()
+        self.refresh_frame_progress()
+
+    def refresh_session_status(self):
+        """Cheap refresh for navigation: no per-frame work.
+
+        Updates what depends on *which* frame is open, rather than on how
+        many frames are labeled.
+        """
+        self.update_next_step_hint()
+        self._sync_history_buttons()
+        self._update_slice_panel_visibility()
+
+    def refresh_slice_markers(self):
+        """Mark every slice row as labeled or still to do."""
+        if not hasattr(self, "slice_list"):
+            return
+        for index in range(self.slice_list.count()):
+            item = self.slice_list.item(index)
+            self._apply_labeled_marker(item, item.text())
+
+    def refresh_frame_progress(self):
+        """Update the row markers, frame counter, progress bar and hint.
+
+        Markers and counts come from one pass, so a dot can never
+        disagree with the number beside it. Rows that already look right
+        cost one comparison and no widget calls, which is what keeps the
+        pass affordable on a long clip.
+        """
+        if not hasattr(self, "image_list"):
+            return
+        if self._defer_refresh():
+            return
+        self.refresh_slice_markers()
+
+        total = self.image_list.count()
+        labeled = 0
+        for index in range(total):
+            item = self.image_list.item(index)
+            name = item.text()
+            has_labels = self.frame_has_labels(name)
+            if has_labels:
+                labeled += 1
+            self._apply_labeled_marker(item, name, has_labels)
+
+        if hasattr(self, "frame_progress"):
+            self.frame_progress.setMaximum(max(total, 1))
+            self.frame_progress.setValue(labeled)
+            self.frame_progress.setVisible(total > 0)
+        if hasattr(self, "frame_progress_label"):
+            if total == 0:
+                self.frame_progress_label.setText("No frames loaded")
+            else:
+                percent = round(100 * labeled / total)
+                remaining = total - labeled
+                self.frame_progress_label.setText(
+                    f"{labeled} of {total} labeled ({percent}%) — "
+                    f"{remaining} to go"
+                )
+
+        self._update_frame_count_label()
+        self.update_next_step_hint()
+        self._sync_history_buttons()
+
+    def _leave_frame_filter(self):
+        """Return focus to the canvas so the shortcut keys work again."""
+        target = None
+        for index in range(self.image_list.count()):
+            if not self.image_list.item(index).isHidden():
+                target = self.image_list.item(index)
+                break
+        if target is not None and self.image_list.currentItem() is None:
+            self.image_list.setCurrentItem(target)
+            self.switch_image(target)
+        self.image_label.setFocus()
+
+    def apply_frame_filter(self):
+        """Hide frame rows that do not match the filter box or Todo toggle.
+
+        Rows are hidden rather than removed so every existing lookup by
+        ``findItems`` / ``item(index)`` keeps seeing the full project.
+        """
+        if not hasattr(self, "image_list") or not hasattr(self, "frame_filter_edit"):
+            return
+        if self._defer_refresh():
+            return
+        needle = self.frame_filter_edit.text().strip().lower()
+        todo_only = self.unlabeled_only_button.isChecked()
+        hidden = 0
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            name = item.text()
+            matches = needle in name.lower() if needle else True
+            if todo_only and self.frame_has_labels(name):
+                matches = False
+            # Never hide what is currently open. The list holds stack file
+            # names rather than slice names, so this also covers the case
+            # where a slice of that stack is the thing on the canvas. It
+            # would look as though the open frame had left the project.
+            if name == self.image_file_name:
+                matches = True
+            item.setHidden(not matches)
+            hidden += 0 if matches else 1
+
+        self._hidden_frame_count = hidden
+        self._update_frame_count_label()
+
+    def _update_frame_count_label(self):
+        """Show the plain frame count, or how many survive the filter."""
+        if not hasattr(self, "frame_count_label"):
+            return
+        total = self.image_list.count()
+        hidden = min(getattr(self, "_hidden_frame_count", 0), total)
+        # Restore the plain count when nothing is filtered out — otherwise
+        # clearing the filter box left a stale "2 of 5 shown".
+        self.frame_count_label.setText(
+            f"{total - hidden} of {total} shown" if hidden else f"{total} loaded"
+        )
+
+    def update_next_step_hint(self):
+        """Say what to do next, based on where the session actually is."""
+        if not hasattr(self, "workflow_hint"):
+            return
+        if self.image_list.count() == 0:
+            text = (
+                "Add frames to start — “Add New Images” for stills, "
+                "“Open Video Clip...” to pull a range out of a recording."
+            )
+        elif not self.class_mapping:
+            text = (
+                "Add label classes — “Droplets only” or “Droplets + arc” "
+                "load the agreed ER70S-6 colours."
+            )
+        elif not self.current_class:
+            text = "Select a class in the list below, then pick a drawing tool."
+        else:
+            count = sum(
+                len(annotations)
+                for class_name, annotations in (
+                    self.all_annotations.get(self.image_file_name) or {}
+                ).items()
+                if not str(class_name).startswith("Temp-")
+            )
+            if count == 0:
+                text = (
+                    f"Drawing “{self.current_class}”. P polygon, B paint, "
+                    "Enter to finish a polygon."
+                )
+            else:
+                text = (
+                    f"{count} label{'s' if count != 1 else ''} on this frame. "
+                    "D moves to the next frame, C copies the selection forward."
+                )
+        self.workflow_hint.setText(text)
+
+    def update_project_identity(self):
+        """Keep the sidebar header in step with the open project."""
+        if not hasattr(self, "project_name_label"):
+            return
+        if hasattr(self, "current_project_file"):
+            name = os.path.splitext(os.path.basename(self.current_project_file))[0]
+            self.project_name_label.setText(name)
+        else:
+            self.project_name_label.setText("No project")
+
+        frames = self.image_list.count() if hasattr(self, "image_list") else 0
+        classes = len(self.class_mapping)
+        if not hasattr(self, "current_project_file"):
+            self.project_meta_label.setText("Create or open a project to begin")
+        else:
+            self.project_meta_label.setText(
+                f"{frames} frame{'s' if frames != 1 else ''} · "
+                f"{classes} class{'es' if classes != 1 else ''}"
+            )
+
+    # --- Undo / redo ---------------------------------------------------
+
+    def record_annotation_history(self, label: str = "", frame_name: str = None):
+        """Snapshot the current frame before an edit changes it.
+
+        Returns the frame the snapshot was taken for, so a caller whose
+        edit may still be abandoned can undo the recording with
+        ``discard_annotation_history``.
+        """
+        target = frame_name or self.current_slice or self.image_file_name
+        if not target:
+            return None
+        self.annotation_history.record(
+            target, self.all_annotations.get(target), label
+        )
+        self._sync_history_buttons()
+        return target
+
+    def discard_annotation_history(self, frame_name):
+        """Undo a recording for an edit that did not happen after all.
+
+        Recording clears the redo stack, so a snapshot taken before a
+        dialog the user then cancels would silently throw a redo branch
+        away and leave an undo step that restores an identical state.
+        """
+        if not frame_name:
+            return
+        self.annotation_history.discard_last(frame_name)
+        self._sync_history_buttons()
+
+    def _current_history_key(self):
+        return self.current_slice or self.image_file_name
+
+    def _sync_history_buttons(self):
+        if not hasattr(self, "undo_button"):
+            return
+        key = self._current_history_key()
+        can_undo = bool(key) and self.annotation_history.can_undo(key)
+        can_redo = bool(key) and self.annotation_history.can_redo(key)
+        self.undo_button.setEnabled(can_undo)
+        self.redo_button.setEnabled(can_redo)
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(can_undo)
+            self.redo_action.setEnabled(can_redo)
+
+    def _restore_annotation_state(self, key, restored):
+        """Put a snapshot back and refresh everything that reads from it."""
+        if restored:
+            self.all_annotations[key] = restored
+        else:
+            self.all_annotations.pop(key, None)
+
+        self.image_label.annotations = copy.deepcopy(
+            self.all_annotations.get(key, {})
+        )
+        self.image_label.reset_annotation_state()
+        self.image_label.clear_current_annotation()
+        self.image_label.highlighted_annotations.clear()
+        self.update_annotation_list()
+        # update_slice_list_colors ends in annotations_changed(), which
+        # covers the markers, the filter and the counters.
+        self.update_slice_list_colors()
+        self.image_label.update()
+        self.update_status_bar()
+
+    def undo_annotation_change(self):
+        """Step one annotation edit back on the current frame."""
+        if self._sam3_inference_in_flight:
+            return
+        key = self._current_history_key()
+        if not key:
+            return
+        step = self.annotation_history.undo(key, self.all_annotations.get(key))
+        if step is None:
+            return
+        label, restored = step
+        self._restore_annotation_state(key, restored)
+        self._sync_history_buttons()
+        self.statusBar().showMessage(
+            f"Undid {label}" if label else "Undid the last change", 2500
+        )
+        self._save_after_history_step()
+
+    def redo_annotation_change(self):
+        """Re-apply the annotation edit that was just undone."""
+        if self._sam3_inference_in_flight:
+            return
+        key = self._current_history_key()
+        if not key:
+            return
+        step = self.annotation_history.redo(key, self.all_annotations.get(key))
+        if step is None:
+            return
+        label, restored = step
+        self._restore_annotation_state(key, restored)
+        self._sync_history_buttons()
+        self.statusBar().showMessage(
+            f"Redid {label}" if label else "Redid the last change", 2500
+        )
+        self._save_after_history_step()
+
+    def _save_after_history_step(self):
+        """Persist an undo/redo, but never interrupt it with a dialog.
+
+        ``auto_save`` prompts "you need to save the project first" when
+        there is no project file. Ctrl+Z is a reflex key; a modal on it
+        would be unusable in a workspace the annotator has not saved yet.
+        """
+        if hasattr(self, "current_project_file"):
+            self.auto_save()
+        else:
+            self.set_saved_state(False)
+
+    # --- Keyboard ------------------------------------------------------
+
+    def _install_workflow_shortcuts(self):
+        """Plain-key tool and class shortcuts, via one event filter.
+
+        Two things rule out the obvious "one QShortcut per key" approach:
+
+        * The Ctrl combinations are already owned by menu actions
+          (Edit > Undo / Redo, Help > Keyboard Shortcuts). Binding the
+          same sequence a second time makes it ambiguous, and Qt then
+          fires *neither* — measured: with both bindings present, Ctrl+Z
+          did nothing at all.
+        * Application-context QShortcuts are cheap individually but a set
+          this size (four tool letters plus nine class digits, on top of
+          the existing A/D/C/F2) crashed Qt's shortcut map during teardown
+          on PyQt6 6.11 here.
+
+        One filter also matches how DINO review keys are already handled
+        (see ``_DINOReviewEventFilter``), and puts the "is the user typing
+        in a text box" test in a single place.
+        """
+        self._workflow_key_filter = _WorkflowKeyFilter(self)
+        QApplication.instance().installEventFilter(self._workflow_key_filter)
+
+    def handle_workflow_key(self, key, target=None) -> bool:
+        """Act on a plain tool or class key. Returns True if consumed."""
+        if self._sam3_inference_in_flight or self._typing_in_text_field(target):
+            return False
+
+        tool_keys = {
+            Qt.Key.Key_P: "polygon_button",
+            Qt.Key.Key_R: "rectangle_button",
+            Qt.Key.Key_B: "paint_brush_button",
+            Qt.Key.Key_E: "eraser_button",
+        }
+        if key in tool_keys:
+            self._activate_tool_shortcut(tool_keys[key])
+            return True
+
+        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            index = key - Qt.Key.Key_1
+            if index < self.class_list.count():
+                self.select_class_by_index(index)
+                return True
+        return False
+
+    #: Widgets that must receive letters and digits themselves.
+    _TEXT_ENTRY_WIDGETS = (QLineEdit, QTextEdit, QAbstractSpinBox)
+
+    #: Additionally exempt when the key is being delivered straight to
+    #: them: a combo box uses letters for type-ahead, which is how the
+    #: SAM and DINO model pickers are normally driven. Not exempt via
+    #: focusWidget(), because a non-editable combo keeps focus after its
+    #: popup closes and would then swallow every tool key.
+    _TYPEAHEAD_WIDGETS = (QComboBox,)
+
+    def _typing_in_text_field(self, target=None) -> bool:
+        """True while a text input is taking the keystroke.
+
+        Checks the widget the event was delivered to when one is given —
+        the application's focus widget is null while the window is not
+        active, which would let a tool key steal a character out of the
+        frame filter box.
+        """
+        exempt = self._TEXT_ENTRY_WIDGETS + self._TYPEAHEAD_WIDGETS
+        if isinstance(target, exempt):
+            return True
+        if target is not None and isinstance(target, QWidget):
+            if isinstance(target.parentWidget(), exempt):
+                return True
+        return isinstance(QApplication.focusWidget(), self._TEXT_ENTRY_WIDGETS)
+
+    def _activate_tool_shortcut(self, button_name):
+        """Toggle a drawing tool from its letter key.
+
+        Goes through ``click()`` rather than calling ``toggle_tool``
+        directly: ``toggle_tool`` identifies the tool from ``sender()``,
+        so a direct call would look like it came from nowhere and would
+        fall back to the magic-wand button.
+        """
+        if self._typing_in_text_field() or self._sam3_inference_in_flight:
+            return
+        button = getattr(self, button_name, None)
+        if button is None or not button.isEnabled():
+            return
+        button.click()
+
+    def select_class_by_index(self, index):
+        """Select the class at ``index`` in the class list (keys 1-9)."""
+        if self._typing_in_text_field():
+            return
+        if 0 <= index < self.class_list.count():
+            item = self.class_list.item(index)
+            self.class_list.setCurrentItem(item)
+            self.on_class_selected(item)
+
+    def show_shortcut_reference(self):
+        dialog = ShortcutReferenceDialog(self)
+        dialog.exec()
 
     ##########    ### Tools  ########## I love useful image processing tools :)
     def open_dataset_splitter(self):
@@ -4729,6 +5718,11 @@ class ImageAnnotator(QMainWindow):
 
         # Clear annotations
         self.all_annotations.clear()
+        # History is keyed by bare frame name, so leaving it behind
+        # would let one Ctrl+Z inject the closed project's
+        # annotations into a new project that reuses a file name —
+        # and undo auto-saves, so that reaches the .iap file.
+        self.annotation_history.clear()
         self.annotation_list.clear()
         self.image_label.annotations.clear()
         self.image_label.highlighted_annotations.clear()
@@ -4816,30 +5810,43 @@ class ImageAnnotator(QMainWindow):
         QMessageBox.information(self, title, message)
 
     def update_image_info(self, additional_info=None):
-        if hasattr(self, "frame_count_label"):
-            self.frame_count_label.setText(f"{self.image_list.count()} loaded")
         if hasattr(self, "canvas_file_label"):
             self.canvas_file_label.setText(
-                self.current_slice or self.image_file_name or "Add images to begin"
+                self.current_slice or self.image_file_name or "No frame loaded"
             )
+
+        position = ""
+        if self.frame_sequence:
+            frame = self.frame_sequence.frame_for_name(self.image_file_name)
+            if frame:
+                position = f"{frame.index + 1} / {len(self.frame_sequence.frames)}"
+                if frame.source_index is not None:
+                    position += f"  (source {frame.source_index})"
+        elif self.image_file_name and hasattr(self, "image_list"):
+            matches = self.image_list.findItems(
+                self.image_file_name, Qt.MatchFlag.MatchExactly
+            )
+            if matches:
+                row = self.image_list.row(matches[0])
+                position = f"{row + 1} / {self.image_list.count()}"
+        if hasattr(self, "canvas_position_label"):
+            self.canvas_position_label.setText(position)
+
         if self.current_image:
             width = self.current_image.width()
             height = self.current_image.height()
-            info = f"Image: {width}x{height}"
-            if self.frame_sequence:
-                frame = self.frame_sequence.frame_for_name(self.image_file_name)
-                if frame:
-                    clip_position = (
-                        f"{frame.index + 1}/{len(self.frame_sequence.frames)}"
-                    )
-                    info += f", clip frame {clip_position}"
-                    if frame.source_index is not None:
-                        info += f", source frame {frame.source_index}"
+            info = f"{width} x {height} px"
             if additional_info:
-                info += f", {additional_info}"
+                info += f"  ·  {additional_info}"
             self.image_info_label.setText(info)
         else:
             self.image_info_label.setText("No image loaded")
+
+        self._update_canvas_placeholder()
+        # Navigation only. The whole-project scan belongs to
+        # annotations_changed(), which the mutation paths call.
+        self.refresh_session_status()
+        self.update_status_bar()
 
     def show_question(self, title, message):
         return QMessageBox.question(
@@ -4936,9 +5943,14 @@ class ImageAnnotator(QMainWindow):
 
             print(f"Keys to remove: {keys_to_remove}")
 
-            # Remove the annotations
+            # Remove the annotations, and the undo history that describes
+            # them. Re-confirming the dialog usually reproduces the same
+            # slice names, so a surviving entry would let one Ctrl+Z
+            # restore annotations the user was told had been removed —
+            # and undo auto-saves, so it would reach the .iap.
             for key in keys_to_remove:
                 del self.all_annotations[key]
+                self.annotation_history.forget(key)
 
             # print(f"Annotations after removal: {list(self.all_annotations.keys())}")
 
@@ -4992,12 +6004,17 @@ class ImageAnnotator(QMainWindow):
             if image["file_name"] != file_name
         ]
         self.all_annotations.pop(file_name, None)
+        # Drop the undo history with the annotations. History is keyed by
+        # bare frame name, so a stale entry would let one Ctrl+Z re-insert
+        # a removed frame's annotations into a frame that reuses the name.
+        self.annotation_history.forget(file_name)
         self._remove_frame_from_video_sessions(file_name)
 
         base_name = os.path.splitext(file_name)[0]
         if base_name in self.image_slices:
             for slice_name, _ in self.image_slices[base_name]:
                 self.all_annotations.pop(slice_name, None)
+                self.annotation_history.forget(slice_name)
             del self.image_slices[base_name]
             self.slice_list.clear()
 
@@ -5085,6 +6102,8 @@ class ImageAnnotator(QMainWindow):
 
             # Load annotations
             self.all_annotations.clear()
+            # The imported set replaces what history refers to.
+            self.annotation_history.clear()
             for annotation in self.loaded_json["annotations"]:
                 image_id = annotation["image_id"]
                 file_name = image_id_to_filename.get(image_id)
@@ -5190,6 +6209,9 @@ class ImageAnnotator(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            self.record_annotation_history(
+                f"deleting {len(selected_items)} annotation(s)"
+            )
             # Create a list of annotations to remove
             annotations_to_remove = []
             for item in selected_items:
@@ -5315,6 +6337,9 @@ class ImageAnnotator(QMainWindow):
             )
             return
 
+        merge_history_frame = self.record_annotation_history(
+            f"merging {len(selected_items)} annotation(s)"
+        )
         new_annotation = {
             "segmentation": [],
             "category_id": self.class_mapping[class_name],
@@ -5347,6 +6372,9 @@ class ImageAnnotator(QMainWindow):
         msg_box.exec()
 
         if msg_box.clickedButton() == cancel_button:
+            # The snapshot was taken before this dialog; unwind it, or the
+            # abandoned merge would still have cleared the redo branch.
+            self.discard_annotation_history(merge_history_frame)
             return
 
         if msg_box.clickedButton() == delete_button:
@@ -5593,6 +6621,7 @@ class ImageAnnotator(QMainWindow):
         if class_dialog.exec() == QDialog.DialogCode.Accepted:
             new_class = class_combo.currentText()
             current_name = self.current_slice or self.image_file_name
+            self.record_annotation_history(f"changing class to {new_class}")
 
             # Get the current maximum number for the new class
             max_number = max(
@@ -5738,14 +6767,27 @@ class ImageAnnotator(QMainWindow):
         for button in self.tool_group.buttons():
             button.setEnabled(tools_enabled)
 
-        # Update cursor based on the current tool
-        if (
+        # Crosshair for every tool that places a point on the image, not
+        # just the magic wand — an arrow tip is a poor aiming reticle when
+        # the boundary being traced is a few pixels wide.
+        precise_tools = {
+            "polygon",
+            "rectangle",
+            "paint_brush",
+            "eraser",
+            "sam_box",
+            "sam_points",
+        }
+        wand_active = (
             self.image_label.current_tool == "sam_magic_wand"
             and self.sam_magic_wand_button.isEnabled()
-        ):
+        )
+        if wand_active or self.image_label.current_tool in precise_tools:
             self.image_label.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.image_label.setCursor(Qt.CursorShape.ArrowCursor)
+
+        self.update_status_bar()
 
     def on_class_selected(self, current=None, previous=None):
         if not self.image_label.check_unsaved_changes():
@@ -6012,6 +7054,7 @@ class ImageAnnotator(QMainWindow):
                 )
                 return
 
+            self.record_annotation_history("adding a polygon")
             new_annotation = {
                 "segmentation": segmentation,
                 "category_id": self.class_mapping[self.current_class],
@@ -6142,6 +7185,7 @@ class ImageAnnotator(QMainWindow):
                 )
                 return
 
+            self.record_annotation_history("adding a box")
             new_annotation = {
                 "segmentation": segmentation,
                 "category_id": self.class_mapping[self.current_class],
@@ -6657,6 +7701,8 @@ class ImageAnnotator(QMainWindow):
             for item in self.class_list.findItems("Temp-*", Qt.MatchFlag.MatchWildcard)
             if item.checkState() == Qt.CheckState.Checked
         ]
+        if visible_temp_classes:
+            self.record_annotation_history("accepting proposed masks")
 
         for temp_class_name in visible_temp_classes:
             permanent_class_name = temp_class_name[5:]  # Remove "Temp-" prefix
@@ -7034,13 +8080,20 @@ class ImageAnnotator(QMainWindow):
         return conflicts
 
     def _clear_sam3_tracks_from_sources(self, source_frame, objects_to_track):
-        """Remove prior generated results before replacing a tracking run."""
-        for frame_annotations in self.all_annotations.values():
+        """Remove prior generated results before replacing a tracking run.
+
+        Snapshots each frame it is about to strip. This deletion is part
+        of the tracking edit, and it reaches frames the results loop may
+        never touch, so without a snapshot here undo on those frames
+        would restore a state from *after* the deletion — losing the
+        previous run's masks with no way back.
+        """
+        for frame_name, frame_annotations in self.all_annotations.items():
             for class_name, source_id in objects_to_track.values():
                 annotations = frame_annotations.get(class_name)
                 if annotations is None:
                     continue
-                annotations[:] = [
+                remaining = [
                     annotation
                     for annotation in annotations
                     if not (
@@ -7049,6 +8102,32 @@ class ImageAnnotator(QMainWindow):
                         and annotation.get("sam3_source_id") == source_id
                     )
                 ]
+                if len(remaining) != len(annotations):
+                    # Looked up defensively: the SAM 3 guard tests call
+                    # this method unbound against a lightweight stand-in.
+                    recorder = getattr(
+                        self, "_record_tracking_history_once", None
+                    )
+                    if callable(recorder):
+                        recorder(frame_name)
+                annotations[:] = remaining
+
+    def _record_tracking_history_once(self, frame_name):
+        """Snapshot a frame the first time a tracking run touches it.
+
+        One tracking run clears the previous run's masks and then writes
+        new ones, and both halves reach the same frames. Recording each
+        frame only once makes the whole run a single undo step, instead
+        of leaving the annotator to press Ctrl+Z twice per frame and see
+        a half-cleared state in between.
+        """
+        recorded = getattr(self, "_sam3_history_recorded", None)
+        if recorded is None:
+            recorded = self._sam3_history_recorded = set()
+        if frame_name in recorded:
+            return
+        recorded.add(frame_name)
+        self.record_annotation_history("SAM 3 tracking", frame_name)
 
     def open_frame_folder(self):
         if self._reject_while_sam3_busy():
@@ -7387,16 +8466,45 @@ class ImageAnnotator(QMainWindow):
         if self._sam3_inference_in_flight:
             return
         if not self.frame_sequence:
+            self._step_through_image_list(1)
             return
         frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
         next_name = self.frame_sequence.name_for_index(frame_idx + 1) if frame_idx is not None else None
         if next_name:
             self._navigate_to_image_or_slice(next_name)
 
+    def _step_through_image_list(self, offset):
+        """Move through the frame list when there is no video sequence.
+
+        A / D previously did nothing at all for a project built from
+        still images, while the canvas header and the frames panel both
+        advertise them — so the app looked broken to anyone who had not
+        opened a video clip. Frames hidden by the filter are skipped, so
+        the keys walk what the annotator can actually see.
+        """
+        total = self.image_list.count()
+        if total == 0:
+            return
+        row = self.image_list.currentRow()
+        if row < 0:
+            row = 0 if offset > 0 else total - 1
+            target = row
+        else:
+            target = row + offset
+        while 0 <= target < total and self.image_list.item(target).isHidden():
+            target += offset
+        if not (0 <= target < total):
+            return
+        # setCurrentItem fires currentRowChanged, which is already wired
+        # to switch_image — calling it again here would load the frame
+        # twice on every keypress.
+        self.image_list.setCurrentItem(self.image_list.item(target))
+
     def go_to_previous_frame(self):
         if self._sam3_inference_in_flight:
             return
         if not self.frame_sequence:
+            self._step_through_image_list(-1)
             return
         frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
         previous_name = self.frame_sequence.name_for_index(frame_idx - 1) if frame_idx is not None else None
@@ -7427,6 +8535,11 @@ class ImageAnnotator(QMainWindow):
             return
 
         self.save_current_annotations()
+        # The copy lands on the *next* frame, so that is the frame whose
+        # state undo has to be able to restore.
+        self.record_annotation_history(
+            "copying an annotation forward", next_image_name
+        )
         for item in selected_items:
             annotation = copy.deepcopy(item.data(Qt.ItemDataRole.UserRole))
             class_name = annotation.get("category_name")
@@ -7584,6 +8697,9 @@ class ImageAnnotator(QMainWindow):
             return
 
         next_name = None
+        # One undo step per frame for the whole run — the clear below and
+        # the write loop both reach the same frames.
+        self._sam3_history_recorded = set()
         try:
             self._sam3_inference_in_flight = True
             self.setCursor(Qt.CursorShape.WaitCursor)
@@ -7604,6 +8720,11 @@ class ImageAnnotator(QMainWindow):
                 frame_name = self.frame_sequence.name_for_index(out_frame_idx)
                 if not frame_name:
                     continue
+                # Snapshot before writing. Undo is per frame, so without
+                # this a Ctrl+Z on a tracked frame would restore a state
+                # from before the run and silently discard the tracked
+                # masks along with whatever else changed since.
+                self._record_tracking_history_once(frame_name)
                 frame_annotations = self.all_annotations.setdefault(frame_name, {})
 
                 for object_id, segmentations in segmentations_by_object.items():
@@ -7634,6 +8755,12 @@ class ImageAnnotator(QMainWindow):
 
             saved = self.auto_save()
             self.update_annotation_list()
+            # Unconditional: the clear above changes label state even on a
+            # run that produced nothing, and the navigation at the end of
+            # this method — which used to be the only refresh — is skipped
+            # when tracking produced no masks, the save failed, or this is
+            # the last frame.
+            self.annotations_changed()
             self.image_label.update()
             if tracked_annotation_count:
                 if not saved:

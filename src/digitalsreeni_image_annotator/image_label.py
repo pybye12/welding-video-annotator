@@ -163,6 +163,43 @@ class ImageLabel(QLabel):
     def set_main_window(self, main_window):
         self.main_window = main_window
 
+    def _record_history(self, label):
+        """Ask the window to snapshot this frame before we change it.
+
+        Returns the frame recorded, or None, so a caller whose edit may
+        turn out to be a no-op can unwind it with ``_discard_history``.
+
+        Looked up defensively: ImageLabel is also driven by lightweight
+        stand-in objects in the unit tests, which implement only the few
+        main-window attributes each test needs.
+        """
+        recorder = getattr(self.main_window, "record_annotation_history", None)
+        if callable(recorder):
+            return recorder(label)
+        return None
+
+    def _discard_history(self, frame_name):
+        """Unwind a snapshot for a stroke that changed nothing.
+
+        Recording clears the redo stack, so a brush stroke entirely below
+        the minimum-area threshold, or an eraser stroke that missed every
+        annotation, would otherwise throw the redo branch away and leave
+        an undo step that does nothing visible.
+        """
+        discard = getattr(self.main_window, "discard_annotation_history", None)
+        if frame_name and callable(discard):
+            discard(frame_name)
+
+    def _notify_cursor(self, position):
+        """Report the cursor's image coordinates to the status bar.
+
+        Targets the coordinate field only — this runs on every mouse-move
+        over the canvas, the hottest path in the app.
+        """
+        reporter = getattr(self.main_window, "update_cursor_readout", None)
+        if callable(reporter):
+            reporter(position)
+
     def set_dark_mode(self, is_dark):
         self.dark_mode = is_dark
         self.update()
@@ -278,6 +315,8 @@ class ImageLabel(QLabel):
     def commit_paint_annotation(self):
         if self.temp_paint_mask is not None and self.main_window.current_class:
             class_name = self.main_window.current_class
+            history_frame = self._record_history("paint stroke")
+            committed = 0
             contours, _ = cv2.findContours(
                 self.temp_paint_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -291,6 +330,11 @@ class ImageLabel(QLabel):
                     }
                     self.annotations.setdefault(class_name, []).append(new_annotation)
                     self.main_window.add_annotation_to_list(new_annotation)
+                    committed += 1
+            if not committed:
+                # Every contour was under the area threshold: nothing was
+                # added, so there is nothing to undo.
+                self._discard_history(history_frame)
             self.temp_paint_mask = None
             self.main_window.save_current_annotations()
             self.main_window.update_slice_list_colors()
@@ -326,6 +370,7 @@ class ImageLabel(QLabel):
 
     def commit_eraser_changes(self):
         if self.temp_eraser_mask is not None:
+            history_frame = self._record_history("eraser stroke")
             eraser_mask = self.temp_eraser_mask.astype(bool)
             current_name = (
                 self.main_window.current_slice or self.main_window.image_file_name
@@ -359,7 +404,12 @@ class ImageLabel(QLabel):
                         new_annotation["number"] = max_number
                     updated_annotations.append(new_annotation)
             if class_name in self.annotations:
+                if updated_annotations == self.annotations[class_name]:
+                    # The stroke missed every annotation of this class.
+                    self._discard_history(history_frame)
                 self.annotations[class_name] = updated_annotations
+            else:
+                self._discard_history(history_frame)
 
             self.temp_eraser_mask = None
 
@@ -520,9 +570,13 @@ class ImageLabel(QLabel):
             painter.restore()
 
     def draw_tool_size_indicator(self, painter):
-        if self.current_tool in ["paint_brush", "eraser"] and hasattr(
-            self, "cursor_pos"
-        ):
+        # Guard the *value*, not the attribute. __init__ always sets
+        # cursor_pos, so `hasattr` was never False: arming the brush or
+        # eraser without the mouse having entered the canvas — clicking
+        # the sidebar button, or pressing B / E — left cursor_pos None and
+        # the next repaint raised TypeError inside paintEvent, which Qt
+        # turns into an abort.
+        if self.current_tool in ("paint_brush", "eraser") and self.cursor_pos:
             painter.save()
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.zoom_factor, self.zoom_factor)
@@ -949,6 +1003,7 @@ class ImageLabel(QLabel):
         if not self.original_pixmap:
             return
         self.cursor_pos = self.get_image_coordinates(event.position())
+        self._notify_cursor(self.cursor_pos)
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.buttons() == Qt.MouseButton.LeftButton:
             if self.pan_start_pos:
                 cur = event.globalPosition()

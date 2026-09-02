@@ -21,6 +21,11 @@ uploaded by the application.
 - Export COCO, YOLO segmentation, Pascal VOC, class-ID masks, or RGB masks.
 - Keep custom classes for general datasets or apply the included ER70S-6 presets.
 - Use the guided **Label** and **Auto-track** workspaces without model jargon.
+- Undo and redo annotation changes per frame with `Ctrl+Z` / `Ctrl+Shift+Z`.
+- See at a glance how much of a clip is labeled, and filter down to the frames
+  still to do.
+- Work keyboard-first: `A`/`D` to move between frames, `P`/`R`/`B`/`E` to pick a
+  tool, `1`-`9` to switch class. `Ctrl+/` lists everything.
 - Create a team review package with source frames, exact RGB masks, overlays,
   and a browser page before labeling an entire dataset.
 
@@ -36,6 +41,10 @@ uploaded by the application.
 | Welding setup | User-created classes | ER70S-6 Full Arc and CAVITAR class/color presets |
 | Export | Existing annotation formats | Strict multiclass RGB masks, blank masks, overlap checks, and safe staged export |
 | Reliability | Upstream behavior | Automated unit, UI, and integration tests for the added workflows |
+| Correcting mistakes | No undo | Per-frame undo/redo across every annotation edit |
+| Tracking progress | Plain file list | Labeled markers, a "N of M labeled" bar, a name filter, and a "Todo" toggle |
+| Session state | Spread across panels | One status line: active tool, class, cursor position, brush size, save state |
+| Appearance | Two hand-written stylesheets that drifted | Light and dark generated from one token table, so both stay complete |
 
 SAM 3 does **not** decide whether a region is a droplet, molten consumable, or
 arc. The annotator chooses the class and draws the first polygon; SAM 3 proposes
@@ -95,7 +104,8 @@ sreeni
 6. Review every frame and correct inaccurate boundaries.
 7. Select a class before using **Eraser**. It corrects only that class, so a
    nearby class is not accidentally removed.
-8. Save the project regularly.
+8. Save the project regularly. The status line along the bottom shows when the
+   project last reached disk.
 9. Select an export format and click **Export Training Labels**. Use a new
    empty folder when exporting RGB semantic masks.
 10. Before a full labeling run, click **Create Review Package**, choose about
@@ -141,6 +151,25 @@ checkpoint when prompted. Then:
 
 If the app reports **No valid polygon annotations selected**, select the
 finished polygon row in the Annotations panel before tracking.
+
+## Keyboard
+
+Press `Ctrl+/` in the app for the full list. The ones worth learning first:
+
+| Key | Action |
+|---|---|
+| `A` / `D` | Previous / next frame (video clips and still-image projects alike) |
+| `C` | Copy the selected annotation to the next frame |
+| `P` / `R` / `B` / `E` | Polygon / box / paint brush / eraser |
+| `1` - `9` | Select label class by position in the list |
+| `Enter` | Finish the polygon, or accept proposed masks |
+| `Esc` | Cancel the current shape, or reject proposed masks |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo the last annotation change on this frame |
+| `Ctrl+0` | Fit the frame to the window |
+| `Ctrl+D` | Switch between light and dark |
+
+Undo history is kept per frame, so undoing never rewrites a frame you are not
+looking at.
 
 ## Tech Stack
 
