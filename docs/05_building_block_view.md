@@ -221,6 +221,21 @@ SAM 3 remains separate from `SAMUtils`: SAM 2 owns single-image assistance,
 while `SAM3Tracker` owns an optional Meta SAM 3 video session. Both use the
 existing `_run_sync` worker-thread pattern.
 
+### Interface Shell Components
+
+| Module | Responsibility |
+|--------|----------------|
+| `theme.py` | Design tokens (`LIGHT_TOKENS` / `DARK_TOKENS`) plus `build_stylesheet()`, the single source both QSS sheets are generated from. `tokens_for(dark_mode)` serves the same palette to widgets that paint colours in Python. |
+| `default_stylesheet.py` | Light QSS. Three lines: `build_stylesheet(LIGHT_TOKENS)`. |
+| `soft_dark_stylesheet.py` | Dark QSS. Three lines: `build_stylesheet(DARK_TOKENS)`. |
+| `annotation_history.py` | `AnnotationHistory` — bounded per-frame undo/redo over deep-copied annotation snapshots. |
+| `shortcuts.py` | `SHORTCUT_SECTIONS`, the one list of every key the app responds to, and `ShortcutReferenceDialog` which renders it (Help > Keyboard Shortcuts, Ctrl+/). |
+
+`ImageAnnotator` owns the shell around these: a three-pane `QSplitter`
+(controls / canvas / frames), a `QStatusBar` reporting tool, class,
+cursor position, brush size and save state, and a `QStackedWidget` that
+shows a placeholder until a frame is open.
+
 ## Data Model
 
 ### Project JSON Structure

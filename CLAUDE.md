@@ -22,7 +22,8 @@ python -m src.digitalsreeni_image_annotator.main
 
 Python 3.10+ | PyQt6 6.7+ | Ultralytics 8.3.27 (SAM 2) | NumPy | OpenCV | Shapely
 
-**Test suite**: `tests/` (pytest + pytest-qt). 65 tests pass on PyQt6.
+**Test suite**: `tests/` (pytest + pytest-qt). 232 tests pass on PyQt6
+(one SAM 3 test needs `torch` installed).
 
 ## Documentation
 
@@ -47,6 +48,9 @@ src/digitalsreeni_image_annotator/
 ├── utils.py                   # Utility functions
 ├── export_formats.py          # COCO, YOLO, Pascal VOC exporters
 ├── import_formats.py          # COCO, YOLO importers
+├── theme.py                   # Design tokens; BOTH stylesheets generated here
+├── annotation_history.py      # Per-frame undo/redo snapshots
+├── shortcuts.py               # Keyboard reference (data + dialog)
 └── [tool dialogs]             # Standalone utility windows
 ```
 
@@ -57,6 +61,7 @@ src/digitalsreeni_image_annotator/
 | `ImageAnnotator` | annotator_window.py | Main window, state (`all_annotations`, `class_mapping`, etc.) |
 | `ImageLabel` | image_label.py | Image display, zoom/pan, annotation interaction |
 | `SAMUtils` | sam_utils.py | Load SAM models, run inference |
+| `AnnotationHistory` | annotation_history.py | Per-frame undo/redo over annotation snapshots |
 
 See [Building Block View](docs/05_building_block_view.md) for detailed class documentation.
 
@@ -147,6 +152,19 @@ See [Runtime View](docs/06_runtime_view.md#multi-dimensional-image-loading) for 
 | Export image-path lookup | Exact-key match first, substring fallback only | `"bee.jpg" in "honeybee.jpg"` is True — substring-only matching writes the wrong file. See [Export Format Filename Matching](docs/08_crosscutting_concepts.md#export-format-filename-matching). |
 | F2 / global shortcuts | Use `QShortcut` with `Qt.ShortcutContext.ApplicationShortcut`, not `keyPressEvent` | `QTableWidget` consumes F2 for in-cell edit before it bubbles up. |
 
+### Patterns introduced in v0.9.1 (read before touching these areas)
+
+| Area | Pattern | Why |
+|------|---------|-----|
+| Colors, anywhere | Add the value to **both** token tables in `theme.py`; never write a hex literal in a stylesheet or a widget | The two QSS sheets are *generated* from those tables. A hex literal in one place is exactly how light mode fell behind dark mode before. Python-side colors read `tokens_for(self.dark_mode)`. See [ADR-018](docs/09_architecture_decisions.md#adr-018-generate-both-stylesheets-from-one-token-table). |
+| Any new annotation-mutating path | Call `record_annotation_history("what changed")` **before** the mutation; pass the frame name when writing to a frame other than the open one | Otherwise that edit is silently not undoable. Snapshot-based, so no inverse operation is needed. See [ADR-019](docs/09_architecture_decisions.md#adr-019-undo-via-per-frame-snapshots). |
+| Any path that discards annotations | `annotation_history.clear()` (whole project) or `forget(name)` (one frame) | History is keyed by bare frame name and undo auto-saves, so a stale entry can write a closed project's annotations into a new project's `.iap`. |
+| Progress / frame status | Call `annotations_changed()` after label state changes (`update_slice_list_colors()` delegates to it, which is why existing paths still work). Derive status from `frame_has_labels()` | `Temp-` classes are proposals and do **not** count as labeled. Refreshes are O(all frames), so bulk paths must wrap in `suspended_progress_refresh()` — `load_project_data` adds frames one at a time and was quadratic without it. Markers and counts come from one pass; re-applying an unchanged row is free because each row caches `(labeled, dark_mode)`. |
+| Frame list rows | Marker via `setIcon`, never `setText` or a row background | `item.text()` and `findItems(name, MatchExactly)` are used in a dozen places; a row fill also collides with the selection color. |
+| Frame filtering | `setHidden`, never removing items | Keeps `count()`, `item(i)` and `findItems` seeing the whole project, so no existing caller needs to know about filtering. |
+| Any new keyboard shortcut | Bind the sequence **once**. Ctrl combos → `QAction` (add `setShortcutContext(ApplicationShortcut)` if it must work with focus elsewhere; alternates via `setShortcuts([...])`, de-duplicated). Plain keys → `_WorkflowKeyFilter` | A sequence bound by both a QAction and a QShortcut is ambiguous and Qt fires **neither** — measured with Ctrl+Z. `StandardKey.Redo` is Ctrl+Shift+Z on Linux/macOS but **Ctrl+Y on Windows**, so listing it next to a literal `"Ctrl+Y"` self-collides on Windows. Assert on the shortcut *count*, not membership. See [ADR-020](docs/09_architecture_decisions.md#adr-020-one-event-filter-for-plain-key-shortcuts). |
+| Two-across button rows in the sidebar | Use the `side_by_side(...)` helper in `setup_sidebar` | Buttons report their full label as a minimum width and the sidebar scroll area has horizontal scrolling off, so a wide row is clipped at the right edge. The helper sets an explicit minimum so Qt elides instead. |
+
 ## Development Workflow
 
 **CRITICAL: Always use feature branches — NEVER commit directly to master.**
@@ -219,10 +237,23 @@ See [Risks and Technical Debt](docs/11_risks_and_technical_debt.md) for full lis
 |--------|--------|
 | Ctrl+Wheel | Zoom |
 | Ctrl+Drag | Pan |
+| Ctrl+0 | Fit frame to window |
 | Enter | Finish/Accept |
 | Esc | Cancel |
 | Up/Down | Navigate slices |
 | -/= | Brush size |
+
+| Workflow | Action |
+|----------|--------|
+| A / D | Previous / next frame |
+| C | Copy selected annotation to next frame |
+| P / R / B / E | Polygon / box / paint / eraser |
+| 1-9 | Select label class by position |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / redo annotation change |
+| Ctrl+/ | Keyboard shortcut reference |
+
+`shortcuts.py` is the single source for this list — update
+`SHORTCUT_SECTIONS` there and the in-app dialog follows.
 
 ## Quick Tips
 
