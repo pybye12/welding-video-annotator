@@ -37,8 +37,11 @@ def _run(body, timeout=180):
         # 10 on unmodified upstream — so an exit-code assertion there
         # would be reporting a plugin quirk, not a defect.
         env.pop("QT_QPA_PLATFORM", None)
+    # -u: unbuffered. Python block-buffers stdout when it is a pipe, so a
+    # crash during Qt teardown discards everything the run printed — the
+    # process looks like it produced nothing when in fact it completed.
     return subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-u", "-c", script],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -96,7 +99,7 @@ def test_opening_the_shortcut_dialog_completes_cleanly():
         def open_once():
             dialog = ShortcutReferenceDialog(w)
             dialog.show()
-            assert dialog.windowTitle() == "Keyboard Shortcuts"
+            print(dialog.windowTitle())
             dialog.close()
 
         open_once()
@@ -105,6 +108,9 @@ def test_opening_the_shortcut_dialog_completes_cleanly():
         w.close()
         print("ok")
         """
+    )
+    assert "Keyboard Shortcuts" in result.stdout, (
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "ok" in result.stdout, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
