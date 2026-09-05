@@ -18,6 +18,7 @@ from czifile import CziFile
 from PyQt6.QtCore import (
     QEvent,
     QObject,
+    QSettings,
     QStandardPaths,
     Qt,
     QThread,
@@ -450,12 +451,20 @@ class ImageAnnotator(QMainWindow):
             "XL": 14,
             "XXL": 16,
         }  # Also, add the options in create_menu_bar method
-        self.current_font_size = "Medium"
+        # Appearance is remembered between sessions. An annotator who
+        # prefers light mode, or needs a larger font to read boundaries,
+        # should set it once rather than every launch.
+        self.settings = QSettings("DigitalSreeni", "ImageAnnotator")
 
-        # Dark mode control. Default on — matches the look most users
-        # expect from a 2025-era desktop annotation tool; toggle with
+        saved_font = self.settings.value("appearance/font_size", "Medium")
+        self.current_font_size = (
+            saved_font if saved_font in self.font_sizes else "Medium"
+        )
+
+        # Dark mode control. Defaults on — matches the look most users
+        # expect from a desktop annotation tool; toggle with
         # Settings → Toggle Dark Mode (Ctrl+D).
-        self.dark_mode = True
+        self.dark_mode = self._saved_bool("appearance/dark_mode", True)
 
         # Default annotations sorting
         self.current_sort_method = "class"  # Default sorting method
@@ -535,7 +544,7 @@ class ImageAnnotator(QMainWindow):
         self.refresh_frame_progress()
         self.update_status_bar()
 
-        self.showMaximized()
+        self.restore_window_layout()
 
     def setup_ui(self):
         # Initialize the main layout
@@ -1829,6 +1838,9 @@ class ImageAnnotator(QMainWindow):
         if not self.image_label.check_unsaved_changes():
             event.ignore()
             return
+        # After the ignore() paths, so a cancelled close does not save a
+        # layout the user never meant to keep.
+        self.save_window_layout()
         event.accept()
 
         if (
@@ -2477,6 +2489,15 @@ class ImageAnnotator(QMainWindow):
             super().keyPressEvent(event)
 
     def _trigger_video_shortcut(self, callback):
+        # Only when the main window is the one being typed into. Several
+        # child windows are shown non-modally (help, the Snake easter
+        # egg, the YOLO training dialog), and without this a D pressed in
+        # front of one of them advanced the frame in the window behind
+        # it. _WorkflowKeyFilter already gates the tool and class keys the
+        # same way; these keys reach the app by a different route
+        # (application-context QShortcut) and needed the check adding.
+        if not self.isActiveWindow():
+            return
         # Text entry only. A non-editable QComboBox keeps focus after its
         # popup closes, so including combo boxes here would silently stop
         # A / D advancing frames for the rest of the session — combo
@@ -3394,8 +3415,21 @@ class ImageAnnotator(QMainWindow):
         shortcuts_action.triggered.connect(self.show_shortcut_reference)
         help_menu.addAction(shortcuts_action)
 
+    def _saved_bool(self, key, default):
+        """Read a bool from QSettings.
+
+        QSettings returns strings on some backends (the INI format used
+        on Linux, and anything written by an older build), so a bare
+        bool() would make the string "false" read as True.
+        """
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
     def change_font_size(self, size):
         self.current_font_size = size
+        self.settings.setValue("appearance/font_size", size)
         self.apply_theme_and_font()
 
     def unload_ai_models(self):
@@ -4738,6 +4772,7 @@ class ImageAnnotator(QMainWindow):
 
     def on_font_size_changed(self, size):
         self.current_font_size = size
+        self.settings.setValue("appearance/font_size", size)
         self.apply_theme_and_font()
 
     def apply_theme_and_font(self):
@@ -4773,6 +4808,7 @@ class ImageAnnotator(QMainWindow):
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
+        self.settings.setValue("appearance/dark_mode", self.dark_mode)
         self.apply_theme_and_font()
 
         # Update slice list colors
@@ -5048,6 +5084,56 @@ class ImageAnnotator(QMainWindow):
     # ------------------------------------------------------------------
     # Session status: progress, filtering, the status bar and undo.
     # ------------------------------------------------------------------
+
+    def restore_window_layout(self):
+        """Put the window back where it was, or maximise on first run.
+
+        Panel widths matter here: a lab machine with a wide screen wants
+        a wide frame list for long clip file names, and re-dragging the
+        splitter every launch is exactly the kind of small tax that makes
+        a tool feel unfinished.
+        """
+        geometry = self.settings.value("window/geometry")
+        state = self.settings.value("window/state")
+        restored = False
+        if geometry is not None:
+            try:
+                restored = bool(self.restoreGeometry(geometry))
+            except TypeError:
+                # A settings file written by a different Qt build can hand
+                # back something restoreGeometry will not accept.
+                restored = False
+        if restored and state is not None:
+            try:
+                self.restoreState(state)
+            except TypeError:
+                pass
+        if not restored:
+            self.showMaximized()
+
+        sizes = self.settings.value("window/splitter")
+        if sizes:
+            try:
+                sizes = [int(value) for value in sizes]
+            except (TypeError, ValueError):
+                sizes = None
+            # Ignore a stale layout with the wrong number of panes, or one
+            # that would collapse a pane to nothing.
+            if sizes and len(sizes) == self.main_splitter.count() and all(sizes):
+                self.main_splitter.setSizes(sizes)
+
+    def save_window_layout(self):
+        """Remember size, position and panel widths for next launch.
+
+        sync() forces the write now rather than leaving it pending for
+        QSettings' destructor. That guarantees the layout reaches disk
+        even if the process is killed, and keeps Qt from flushing during
+        interpreter teardown, which is a fragile moment for this app.
+        """
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/state", self.saveState())
+        self.settings.setValue("window/splitter", self.main_splitter.sizes())
+        self.settings.sync()
 
     def setup_status_bar(self):
         """A single line of live session state along the bottom edge.

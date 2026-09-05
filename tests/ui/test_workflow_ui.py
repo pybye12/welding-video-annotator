@@ -82,17 +82,24 @@ def test_marker_and_count_cannot_disagree(qtbot):
 
 
 def test_marker_refresh_skips_rows_that_already_look_right(qtbot):
-    """Navigation refreshes on every frame change; unchanged rows are free."""
+    """Navigation refreshes on every frame change; unchanged rows are free.
+
+    Checks the cache directly rather than monkeypatching setIcon on the
+    item: QListWidgetItem is a sip wrapper, and patching methods on those
+    is not portable.
+    """
     window = _window(qtbot)
     _load_frames(window, ["a.png", "b.png"])
     item = window.image_list.item(0)
-    touched = []
-    item_set_icon = item.setIcon
-    item.setIcon = lambda icon: touched.append(1) or item_set_icon(icon)
+    cached = item.data(window._MARKER_STATE_ROLE)
+    assert cached is not None, "first pass should have recorded the state"
 
+    # A second pass over unchanged rows must be a no-op: same cached
+    # value, so _apply_labeled_marker returns before touching the widget.
     window.refresh_frame_progress()
 
-    assert touched == []
+    assert item.data(window._MARKER_STATE_ROLE) == cached
+    assert cached == (False, window.dark_mode)
 
 
 def test_switching_theme_recolours_the_markers(qtbot):
@@ -271,7 +278,14 @@ def test_redo_sequences_do_not_self_collide_on_windows():
 
 
 def test_undo_and_redo_actually_fire_from_the_keyboard(qtbot):
-    """Asserting on shortcut lists is how the ambiguity bug hid before."""
+    """Asserting on shortcut lists is how the ambiguity bug hid before.
+
+    Needs a window the platform will make active, because Qt only
+    delivers an application shortcut to the active window. The offscreen
+    plugin never activates one on some platforms, so this skips rather
+    than reporting a plugin limitation as a defect — the binding itself
+    is covered without a window by the two tests above.
+    """
     from PyQt6.QtTest import QTest
 
     window = _window(qtbot)
@@ -279,10 +293,17 @@ def test_undo_and_redo_actually_fire_from_the_keyboard(qtbot):
     qtbot.waitExposed(window)
     window.activateWindow()
     window.raise_()
-    if not qtbot.waitUntil(window.isActiveWindow, timeout=2000) and not (
-        window.isActiveWindow()
-    ):  # pragma: no cover - depends on the window manager
-        pytest.skip("window manager did not activate the window")
+    # Poll by hand: qtbot.waitUntil RAISES TimeoutError when the
+    # condition never holds, so `if not qtbot.waitUntil(...)` never
+    # reaches its else branch — it errors instead. That is exactly how
+    # this test failed on Windows CI while passing on Linux and macOS.
+    for _ in range(20):
+        if window.isActiveWindow():
+            break
+        qtbot.wait(50)
+    if not window.isActiveWindow():  # pragma: no cover - platform dependent
+        pytest.skip("this platform does not activate the window")
+
     _load_frames(window, ["a.png"])
     window.image_file_name = "a.png"
     _label(window, "a.png")
@@ -532,3 +553,174 @@ def test_enter_in_the_filter_box_returns_focus_to_the_canvas(qtbot):
     window.frame_filter_edit.returnPressed.emit()
 
     assert not window.frame_filter_edit.hasFocus()
+
+
+# --- Remembered preferences ----------------------------------------------
+
+
+def test_theme_choice_survives_a_restart(qtbot, tmp_path, monkeypatch):
+    """Set it once, not every launch."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: {
+            "appearance/dark_mode": False,
+            "appearance/font_size": "Large",
+        }.get(key, default),
+    )
+
+    window = _window(qtbot)
+
+    assert window.dark_mode is False
+    assert window.current_font_size == "Large"
+
+
+def test_a_string_false_from_settings_is_not_read_as_true(qtbot, monkeypatch):
+    """QSettings hands back strings on the INI backend."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            "false" if key == "appearance/dark_mode" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert window.dark_mode is False
+
+
+def test_an_unknown_saved_font_size_falls_back_to_medium(qtbot, monkeypatch):
+    """A stale or hand-edited settings file must not break startup."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            "Gigantic" if key == "appearance/font_size" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert window.current_font_size == "Medium"
+
+
+def test_toggling_the_theme_writes_the_choice(qtbot):
+    window = _window(qtbot)
+    written = {}
+    window.settings.setValue = lambda key, value: written.__setitem__(key, value)
+
+    before = window.dark_mode
+    window.toggle_dark_mode()
+
+    assert written["appearance/dark_mode"] == (not before)
+
+
+def test_panel_widths_survive_a_restart(qtbot, monkeypatch):
+    """Asserts the saved widths are applied, not what Qt does with them.
+
+    QSplitter clamps to each pane's minimum width and rescales to the
+    current window, so the sizes read back are never the literal saved
+    list — 340 rather than a saved 300, for instance.
+    """
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [300, 900, 400] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+    applied = []
+    window.main_splitter.setSizes = lambda sizes: applied.append(sizes)
+
+    window.restore_window_layout()
+
+    assert applied == [[300, 900, 400]]
+
+
+def test_a_stale_layout_with_the_wrong_pane_count_is_ignored(qtbot, monkeypatch):
+    """An old settings file must not wedge the window."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [500, 500] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert len(window.main_splitter.sizes()) == 3
+
+
+def test_a_layout_that_would_collapse_a_pane_is_ignored(qtbot, monkeypatch):
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [0, 1200, 0] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert all(window.main_splitter.sizes())
+
+
+def test_a_cancelled_close_does_not_save_the_layout(qtbot):
+    """Otherwise backing out of quit still rewrites your panel widths."""
+    from PyQt6.QtGui import QCloseEvent
+
+    window = _window(qtbot)
+    saved = []
+    window.save_window_layout = lambda: saved.append(True)
+    # check_unsaved_changes() returning False is the "user cancelled" path.
+    window.image_label.check_unsaved_changes = lambda: False
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert saved == []
+    assert not event.isAccepted()
+
+
+def test_closing_for_real_saves_the_layout(qtbot):
+    from PyQt6.QtGui import QCloseEvent
+
+    window = _window(qtbot)
+    saved = []
+    window.save_window_layout = lambda: saved.append(True)
+    window.image_label.check_unsaved_changes = lambda: True
+
+    window.closeEvent(QCloseEvent())
+
+    assert saved == [True]
+
+
+def test_frame_keys_do_not_fire_for_a_non_modal_child_window(qtbot):
+    """D pressed in front of the help window moved the frame behind it."""
+    window = _window(qtbot)
+    called = []
+    # The window is hidden in these tests, so it is never active — which
+    # is exactly the state a focused child window puts it in.
+    window._trigger_video_shortcut(lambda: called.append(True))
+
+    assert called == []
+
+
+def test_frame_keys_fire_when_the_main_window_is_active(qtbot):
+    window = _window(qtbot)
+    window.isActiveWindow = lambda: True
+    called = []
+
+    window._trigger_video_shortcut(lambda: called.append(True))
+
+    assert called == [True]
