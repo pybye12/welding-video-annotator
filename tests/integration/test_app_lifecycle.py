@@ -154,7 +154,11 @@ def test_adding_many_frames_one_at_a_time_does_not_refresh_per_frame():
         w.close()
         """
     )
-    assert result.returncode == 0, f"exit {result.returncode}\n{result.stderr}"
+    # No exit-code assertion: this app segfaults during Qt teardown under
+    # the offscreen platform plugin on some platforms — on unmodified
+    # upstream too — and CI runs offscreen everywhere except Ubuntu,
+    # which gets a real DISPLAY from pytest-xvfb. The refresh count is
+    # the actual subject, and -u makes it survive a teardown crash.
     line = next(
         line for line in result.stdout.splitlines() if line.startswith("REFRESHES")
     )
