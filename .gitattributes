@@ -1,0 +1,18 @@
+# Normalise line endings so a Windows checkout does not show every file
+# as modified. Without this, `git status` on Windows listed 45 files with
+# 9132 insertions and 9132 deletions that were pure CRLF noise —
+# `git diff --ignore-all-space` was empty.
+* text=auto
+
+# Binary assets must never be normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pt binary
+*.pth binary
+*.tif binary
+*.tiff binary
+*.czi binary
+*.dcm binary
