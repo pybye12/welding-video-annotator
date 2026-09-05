@@ -617,3 +617,89 @@ def test_toggling_the_theme_writes_the_choice(qtbot):
     window.toggle_dark_mode()
 
     assert written["appearance/dark_mode"] == (not before)
+
+
+def test_panel_widths_survive_a_restart(qtbot, monkeypatch):
+    """Asserts the saved widths are applied, not what Qt does with them.
+
+    QSplitter clamps to each pane's minimum width and rescales to the
+    current window, so the sizes read back are never the literal saved
+    list — 340 rather than a saved 300, for instance.
+    """
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [300, 900, 400] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+    applied = []
+    window.main_splitter.setSizes = lambda sizes: applied.append(sizes)
+
+    window.restore_window_layout()
+
+    assert applied == [[300, 900, 400]]
+
+
+def test_a_stale_layout_with_the_wrong_pane_count_is_ignored(qtbot, monkeypatch):
+    """An old settings file must not wedge the window."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [500, 500] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert len(window.main_splitter.sizes()) == 3
+
+
+def test_a_layout_that_would_collapse_a_pane_is_ignored(qtbot, monkeypatch):
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            [0, 1200, 0] if key == "window/splitter" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert all(window.main_splitter.sizes())
+
+
+def test_a_cancelled_close_does_not_save_the_layout(qtbot):
+    """Otherwise backing out of quit still rewrites your panel widths."""
+    from PyQt6.QtGui import QCloseEvent
+
+    window = _window(qtbot)
+    saved = []
+    window.save_window_layout = lambda: saved.append(True)
+    # check_unsaved_changes() returning False is the "user cancelled" path.
+    window.image_label.check_unsaved_changes = lambda: False
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert saved == []
+    assert not event.isAccepted()
+
+
+def test_closing_for_real_saves_the_layout(qtbot):
+    from PyQt6.QtGui import QCloseEvent
+
+    window = _window(qtbot)
+    saved = []
+    window.save_window_layout = lambda: saved.append(True)
+    window.image_label.check_unsaved_changes = lambda: True
+
+    window.closeEvent(QCloseEvent())
+
+    assert saved == [True]
