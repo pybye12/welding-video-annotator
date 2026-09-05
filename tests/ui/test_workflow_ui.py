@@ -553,3 +553,67 @@ def test_enter_in_the_filter_box_returns_focus_to_the_canvas(qtbot):
     window.frame_filter_edit.returnPressed.emit()
 
     assert not window.frame_filter_edit.hasFocus()
+
+
+# --- Remembered preferences ----------------------------------------------
+
+
+def test_theme_choice_survives_a_restart(qtbot, tmp_path, monkeypatch):
+    """Set it once, not every launch."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: {
+            "appearance/dark_mode": False,
+            "appearance/font_size": "Large",
+        }.get(key, default),
+    )
+
+    window = _window(qtbot)
+
+    assert window.dark_mode is False
+    assert window.current_font_size == "Large"
+
+
+def test_a_string_false_from_settings_is_not_read_as_true(qtbot, monkeypatch):
+    """QSettings hands back strings on the INI backend."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            "false" if key == "appearance/dark_mode" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert window.dark_mode is False
+
+
+def test_an_unknown_saved_font_size_falls_back_to_medium(qtbot, monkeypatch):
+    """A stale or hand-edited settings file must not break startup."""
+    from PyQt6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        QSettings, "value",
+        lambda self, key, default=None, **kw: (
+            "Gigantic" if key == "appearance/font_size" else default
+        ),
+    )
+
+    window = _window(qtbot)
+
+    assert window.current_font_size == "Medium"
+
+
+def test_toggling_the_theme_writes_the_choice(qtbot):
+    window = _window(qtbot)
+    written = {}
+    window.settings.setValue = lambda key, value: written.__setitem__(key, value)
+
+    before = window.dark_mode
+    window.toggle_dark_mode()
+
+    assert written["appearance/dark_mode"] == (not before)

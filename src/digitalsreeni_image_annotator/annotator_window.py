@@ -18,6 +18,7 @@ from czifile import CziFile
 from PyQt6.QtCore import (
     QEvent,
     QObject,
+    QSettings,
     QStandardPaths,
     Qt,
     QThread,
@@ -450,12 +451,20 @@ class ImageAnnotator(QMainWindow):
             "XL": 14,
             "XXL": 16,
         }  # Also, add the options in create_menu_bar method
-        self.current_font_size = "Medium"
+        # Appearance is remembered between sessions. An annotator who
+        # prefers light mode, or needs a larger font to read boundaries,
+        # should set it once rather than every launch.
+        self.settings = QSettings("DigitalSreeni", "ImageAnnotator")
 
-        # Dark mode control. Default on — matches the look most users
-        # expect from a 2025-era desktop annotation tool; toggle with
+        saved_font = self.settings.value("appearance/font_size", "Medium")
+        self.current_font_size = (
+            saved_font if saved_font in self.font_sizes else "Medium"
+        )
+
+        # Dark mode control. Defaults on — matches the look most users
+        # expect from a desktop annotation tool; toggle with
         # Settings → Toggle Dark Mode (Ctrl+D).
-        self.dark_mode = True
+        self.dark_mode = self._saved_bool("appearance/dark_mode", True)
 
         # Default annotations sorting
         self.current_sort_method = "class"  # Default sorting method
@@ -3394,8 +3403,21 @@ class ImageAnnotator(QMainWindow):
         shortcuts_action.triggered.connect(self.show_shortcut_reference)
         help_menu.addAction(shortcuts_action)
 
+    def _saved_bool(self, key, default):
+        """Read a bool from QSettings.
+
+        QSettings returns strings on some backends (the INI format used
+        on Linux, and anything written by an older build), so a bare
+        bool() would make the string "false" read as True.
+        """
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
     def change_font_size(self, size):
         self.current_font_size = size
+        self.settings.setValue("appearance/font_size", size)
         self.apply_theme_and_font()
 
     def unload_ai_models(self):
@@ -4738,6 +4760,7 @@ class ImageAnnotator(QMainWindow):
 
     def on_font_size_changed(self, size):
         self.current_font_size = size
+        self.settings.setValue("appearance/font_size", size)
         self.apply_theme_and_font()
 
     def apply_theme_and_font(self):
@@ -4773,6 +4796,7 @@ class ImageAnnotator(QMainWindow):
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
+        self.settings.setValue("appearance/dark_mode", self.dark_mode)
         self.apply_theme_and_font()
 
         # Update slice list colors
