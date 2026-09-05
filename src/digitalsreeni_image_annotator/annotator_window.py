@@ -2489,6 +2489,15 @@ class ImageAnnotator(QMainWindow):
             super().keyPressEvent(event)
 
     def _trigger_video_shortcut(self, callback):
+        # Only when the main window is the one being typed into. Several
+        # child windows are shown non-modally (help, the Snake easter
+        # egg, the YOLO training dialog), and without this a D pressed in
+        # front of one of them advanced the frame in the window behind
+        # it. _WorkflowKeyFilter already gates the tool and class keys the
+        # same way; these keys reach the app by a different route
+        # (application-context QShortcut) and needed the check adding.
+        if not self.isActiveWindow():
+            return
         # Text entry only. A non-editable QComboBox keeps focus after its
         # popup closes, so including combo boxes here would silently stop
         # A / D advancing frames for the rest of the session — combo

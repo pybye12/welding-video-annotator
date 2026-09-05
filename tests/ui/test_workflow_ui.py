@@ -703,3 +703,24 @@ def test_closing_for_real_saves_the_layout(qtbot):
     window.closeEvent(QCloseEvent())
 
     assert saved == [True]
+
+
+def test_frame_keys_do_not_fire_for_a_non_modal_child_window(qtbot):
+    """D pressed in front of the help window moved the frame behind it."""
+    window = _window(qtbot)
+    called = []
+    # The window is hidden in these tests, so it is never active — which
+    # is exactly the state a focused child window puts it in.
+    window._trigger_video_shortcut(lambda: called.append(True))
+
+    assert called == []
+
+
+def test_frame_keys_fire_when_the_main_window_is_active(qtbot):
+    window = _window(qtbot)
+    window.isActiveWindow = lambda: True
+    called = []
+
+    window._trigger_video_shortcut(lambda: called.append(True))
+
+    assert called == [True]
