@@ -22,39 +22,29 @@ class SAM3Tracker:
     MIN_TRACKED_AREA = 50.0
     MIN_SOURCE_AREA_RATIO = 0.15
 
-    # SAM returned no mask at all: the object has left the frame or merged
-    # into the pool. Give up quickly — continuing risks re-using this
-    # object's id for whatever appears next.
-    MAX_CONSECUTIVE_MISSES = 2
-
-    # SAM returned a mask and our own gates rejected it. Be slower to give
-    # up here: the gates are heuristics, and two unlucky frames (an arc
-    # flash, a moment of occlusion) should not end a run that is otherwise
-    # tracking correctly.
-    MAX_CONSECUTIVE_REJECTIONS = 5
-
     # How much the tracked area may change from the *previous accepted*
-    # frame. A droplet necking down and detaching changes size gradually,
-    # so a per-frame limit lets it shrink to any size over enough frames
-    # while a single catastrophic jump is still refused.
+    # frame. Real objects can change size gradually, so this lets them
+    # shrink or grow over time while a single catastrophic jump is refused.
     MAX_AREA_STEP = 4.0
 
     # A mask may never cover more than this fraction of the frame.
     MAX_FRAME_FRACTION = 0.5
 
     # How far the mask's centre may travel in one frame, as a fraction of
-    # the frame diagonal. This is what catches drift onto the background
-    # plate: the size gates alone cannot tell a plausible blob in the
+    # the frame diagonal. Size alone cannot tell a plausible blob in the
     # wrong place from the right one.
     MAX_CENTROID_STEP_FRACTION = 0.25
+
+    # Prevent a compact source object from gradually drifting into an elongated
+    # background region while still allowing ordinary deformation and rotation.
+    MAX_SOURCE_ELONGATION_RATIO = 4.0
 
     def __init__(self, checkpoint_path, predictor=None):
         self.checkpoint_path = checkpoint_path
         self.predictor = predictor
         self.session_id = None
-        # Filled in by track_polygons: per object, how many frames it
-        # produced and why it stopped. Read by the window so a short run
-        # can explain itself instead of going quiet.
+        # Filled in by track_polygons so the UI can distinguish masks saved,
+        # frames checked, masks skipped, and genuine tracking failures.
         self.last_run_report = {}
         if self.predictor is None:
             self._load_predictor()
@@ -384,19 +374,31 @@ class SAM3Tracker:
                 request["max_frame_num_to_track"] = max_frame_num_to_track
             results = []
             active_object_ids = set(source_areas)
-            consecutive_misses = {object_id: 0 for object_id in source_areas}
-            consecutive_rejections = {object_id: 0 for object_id in source_areas}
             # Each object's last accepted frame, which every later frame is
             # judged against. Seeded from the drawn polygon.
+            source_elongations = {}
+            for object_id, source_mask in source_masks.items():
+                source_contour, _ = self._largest_contour(source_mask)
+                source_elongations[object_id] = self.contour_elongation(
+                    source_contour
+                )
             references = {
                 object_id: {
                     "area": source_areas[object_id],
                     "centroid": self._mask_centroid(source_masks[object_id]),
+                    "source_elongation": source_elongations[object_id],
                 }
                 for object_id in source_areas
             }
             report = {
-                object_id: {"frames": 0, "last_frame": None, "stopped": ""}
+                object_id: {
+                    "frames": 0,
+                    "last_frame": None,
+                    "processed_through": None,
+                    "skipped": 0,
+                    "last_issue": "",
+                    "stopped": "",
+                }
                 for object_id in source_areas
             }
             self.last_run_report = report
@@ -406,6 +408,7 @@ class SAM3Tracker:
                 segmentations_by_object = {}
                 masks_by_object = self.extract_masks_from_outputs(response["outputs"])
                 for object_id in list(active_object_ids):
+                    report[object_id]["processed_through"] = frame_index
                     mask = masks_by_object.get(object_id)
 
                     if frame_index == frame_idx:
@@ -440,8 +443,6 @@ class SAM3Tracker:
                         )
 
                     if segmentation:
-                        consecutive_misses[object_id] = 0
-                        consecutive_rejections[object_id] = 0
                         contour = np.asarray(segmentation, dtype=np.float32).reshape(
                             -1, 2
                         )
@@ -450,38 +451,18 @@ class SAM3Tracker:
                             "centroid": self.contour_centroid(
                                 contour.astype(np.int32)
                             ),
+                            "source_elongation": references[object_id][
+                                "source_elongation"
+                            ],
                         }
                         segmentations_by_object[object_id] = [segmentation]
                         report[object_id]["frames"] += 1
                         report[object_id]["last_frame"] = frame_index
                         continue
 
-                    # Two different kinds of failure, with different
-                    # tolerances: "SAM found nothing" means the object is
-                    # gone, while "our gate said no" may just mean the
-                    # gate is wrong about one awkward frame.
-                    if reason == "no mask":
-                        consecutive_misses[object_id] += 1
-                        if (
-                            consecutive_misses[object_id]
-                            >= self.MAX_CONSECUTIVE_MISSES
-                        ):
-                            active_object_ids.discard(object_id)
-                            report[object_id]["stopped"] = (
-                                f"SAM 3 found nothing on "
-                                f"{self.MAX_CONSECUTIVE_MISSES} frames in a row"
-                            )
-                    else:
-                        consecutive_rejections[object_id] += 1
-                        if (
-                            consecutive_rejections[object_id]
-                            >= self.MAX_CONSECUTIVE_REJECTIONS
-                        ):
-                            active_object_ids.discard(object_id)
-                            report[object_id]["stopped"] = (
-                                f"{self.MAX_CONSECUTIVE_REJECTIONS} masks in a "
-                                f"row looked wrong (last: {reason})"
-                            )
+                    # Continue to the requested end without saving bad masks.
+                    report[object_id]["skipped"] += 1
+                    report[object_id]["last_issue"] = reason
                 results.append((frame_index, segmentations_by_object))
                 if not active_object_ids:
                     break
@@ -670,23 +651,29 @@ class SAM3Tracker:
         x, y, width, height = cv2.boundingRect(contour)
         return (x + width / 2.0, y + height / 2.0)
 
+    @staticmethod
+    def contour_elongation(contour):
+        """Rotation-independent ratio of a contour's long side to short side."""
+        if contour is None:
+            return 1.0
+        _, (width, height), _ = cv2.minAreaRect(contour.astype(np.float32))
+        shorter = min(width, height)
+        if shorter <= 0:
+            return 1.0
+        return max(width, height) / shorter
+
     @classmethod
     def evaluate_tracked_mask(cls, mask, reference, frame_size):
         """Accept or reject one propagated mask, against the last good one.
 
-        The gates are relative to the *previous accepted frame*, not to
-        the polygon the annotator drew. Anchoring to the source made a
-        real physical change — a droplet necking down before it detaches
-        — indistinguishable from drift, so tracking gave up part way
-        through exactly the event being studied. Comparing frame to
-        frame instead allows any amount of gradual change while still
-        refusing a single implausible jump.
+        Area and position are compared with the previous accepted frame so
+        gradual motion and deformation remain valid. Elongation is anchored
+        to the source shape to catch slow drift into an unrelated region.
 
         ``reference`` is ``{"area": float, "centroid": (x, y)}`` from the
         last accepted frame. Returns ``(segmentation | None, reason)``;
         ``reason`` is empty when the mask was accepted and otherwise says
-        in plain words why it was not, so a run that stops early can
-        explain itself.
+        in plain words why it was not, so the UI can explain skipped masks.
         """
         frame_width, frame_height = frame_size
         frame_area = float(frame_width) * float(frame_height)
@@ -698,6 +685,17 @@ class SAM3Tracker:
             return None, f"only {int(area)} px, below the {int(cls.MIN_TRACKED_AREA)} px floor"
         if area > frame_area * cls.MAX_FRAME_FRACTION:
             return None, "covered more than half the frame"
+        source_elongation = reference.get("source_elongation")
+        if source_elongation:
+            current_elongation = cls.contour_elongation(contour)
+            elongation_change = max(
+                current_elongation / source_elongation,
+                source_elongation / max(current_elongation, 1e-6),
+            )
+            if elongation_change > cls.MAX_SOURCE_ELONGATION_RATIO:
+                return None, (
+                    f"shape became {elongation_change:.1f}x more elongated"
+                )
 
         reference_area = float(reference["area"])
         if reference_area > 0:

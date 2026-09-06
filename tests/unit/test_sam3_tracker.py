@@ -305,7 +305,7 @@ def test_off_target_prompt_frame_rejects_entire_propagation(tmp_path):
     assert results == [(2, {})]
 
 
-def test_track_ends_after_merge_instead_of_reusing_id_for_new_droplet(tmp_path):
+def test_track_reaches_end_without_reusing_id_for_new_droplet(tmp_path):
     predictor = MergeThenNewDropletPredictor()
     tracker = SAM3Tracker("unused.pt", predictor=predictor)
     tracker.init_state(str(tmp_path))
@@ -317,8 +317,12 @@ def test_track_ends_after_merge_instead_of_reusing_id_for_new_droplet(tmp_path):
     )
 
     assert set(results[0][1]) == {7}
-    assert len(results) == 3
+    assert len(results) == 4
     assert all(not objects for _, objects in results[1:])
+    report = tracker.last_run_report[7]
+    assert report["processed_through"] == 5
+    assert report["skipped"] == 3
+    assert not report["stopped"]
 
 
 def test_segmentation_overlap_ratio_detects_correct_source_region():

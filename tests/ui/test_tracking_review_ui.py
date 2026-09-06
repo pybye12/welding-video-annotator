@@ -361,7 +361,7 @@ def test_the_button_keeps_saying_what_it_does_while_disabled(qtbot):
     """
     window = _window(qtbot)
     tip = window.sam3_track_forward_btn.toolTip()
-    assert "object disappears" in tip
+    assert "nearby loaded frames" in tip
     assert "Prepare Loaded Frames" in tip
 
 
@@ -643,6 +643,22 @@ def test_a_run_that_reached_the_end_reports_no_stop(qtbot):
 
     assert window._tracking_stop_notes({1: ("droplet", "abc")}) == []
 
+
+def test_a_full_run_reports_uncertain_masks_as_skipped(qtbot):
+    window = _window(qtbot)
+    window.sam3_tracker = _ReportingTracker(
+        {
+            1: {"frames": 40, "processed_through": 63, "skipped": 23,
+                "last_issue": "no mask", "stopped": ""}
+        }
+    )
+
+    notes = window._tracking_stop_notes({1: ("object", "abc")})
+
+    assert len(notes) == 1
+    assert "checked through frame 63" in notes[0]
+    assert "skipped 23 uncertain mask(s)" in notes[0]
+    assert "stopped" not in notes[0]
 
 def test_stop_notes_survive_a_tracker_that_reports_nothing(qtbot):
     """Older trackers, and the guard tests' stand-ins, carry no report."""

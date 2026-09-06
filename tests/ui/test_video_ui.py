@@ -14,12 +14,12 @@ def test_video_menu_and_sam_controls_render(qtbot):
 
     assert "Open Video &Clip..." in action_labels
     assert window.sam3_init_btn.text() == "1. Prepare Loaded Frames"
-    assert window.sam3_track_forward_btn.text() == "2. Track Selected to End"
-    assert window.sam3_track_all_btn.text() == "Track All Objects to End"
+    assert window.sam3_track_forward_btn.text() == "2. Track Selected Nearby"
+    assert window.sam3_track_all_btn.text() == "Track All Objects Nearby"
     assert window.sam3_init_btn.property("buttonRole") == "primary"
     assert "Images list" in window.sam3_init_btn.toolTip()
-    assert "every later loaded frame" in window.sam3_track_forward_btn.toolTip()
-    assert "object disappears" in window.sam3_track_forward_btn.toolTip()
+    assert "nearby loaded frames" in window.sam3_track_forward_btn.toolTip()
+    assert "moves to the next frame" in window.sam3_track_forward_btn.toolTip()
     assert "never overwritten" in (
         window.sam3_track_all_btn.toolTip()
     )
@@ -28,12 +28,12 @@ def test_video_menu_and_sam_controls_render(qtbot):
         window.sam3_init_btn.toolTip()
     )
     assert window.open_frame_folder_button.text() == "Open Frame Folder..."
-    assert not window.sam3_stop_at_frame_gaps.isChecked()
+    assert window.sam3_stop_at_frame_gaps.isChecked()
     assert window.sam3_max_frame_gap.value() == 60
     assert window.sam3_max_frame_gap.suffix() == " frames"
-    assert not window.sam3_max_frame_gap.isEnabled()
-    window.sam3_stop_at_frame_gaps.setChecked(True)
     assert window.sam3_max_frame_gap.isEnabled()
+    window.sam3_stop_at_frame_gaps.setChecked(False)
+    assert not window.sam3_max_frame_gap.isEnabled()
 
 
 def test_dino_review_shortcuts_are_consumed_while_sam3_is_busy(qtbot):

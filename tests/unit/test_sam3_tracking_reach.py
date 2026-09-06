@@ -107,15 +107,18 @@ def test_a_steadily_shrinking_droplet_is_followed_far_past_the_old_limit(tmp_pat
     )
 
 
-def test_it_still_stops_once_the_droplet_is_smaller_than_noise(tmp_path):
-    """Tracking a two-pixel speck is not tracking."""
+def test_noise_masks_are_skipped_without_ending_the_requested_run(tmp_path):
+    """Tracking a two-pixel speck is rejected, but later frames are checked."""
     tracker = _tracker(ShrinkingDropletPredictor(frames=60), tmp_path)
 
-    tracker.track_polygons(2, [(7, _flat(_source_polygon()))], FRAME)
+    results = tracker.track_polygons(2, [(7, _flat(_source_polygon()))], FRAME)
 
-    stopped = tracker.last_run_report[7]["stopped"]
-    assert stopped, "a run that ends must record why"
-    assert "px floor" in stopped or "looked wrong" in stopped
+    report = tracker.last_run_report[7]
+    assert len(results) == 60
+    assert report["processed_through"] == 61
+    assert report["skipped"] > 0
+    assert "px floor" in report["last_issue"]
+    assert not report["stopped"]
 
 
 class TeleportingPredictor(ShrinkingDropletPredictor):
@@ -127,9 +130,6 @@ class TeleportingPredictor(ShrinkingDropletPredictor):
 
     def handle_stream_request(self, request):
         self.requests.append(request)
-        # Long enough for the rejection counter to run out, so the run
-        # records why it gave up rather than merely running off the end
-        # of the clip.
         for index in range(10):
             centre = (60, 60) if index < 2 else (160, 185)
             yield {
@@ -156,8 +156,12 @@ def test_a_mask_that_jumps_across_the_frame_is_refused(tmp_path):
     assert labelled == [2, 3], (
         "the jumped frames must not become annotations"
     )
-    stopped = tracker.last_run_report[7]["stopped"]
-    assert "looked wrong" in stopped and "jumped" in stopped
+    report = tracker.last_run_report[7]
+    assert len(results) == 10
+    assert report["processed_through"] == 11
+    assert report["skipped"] == 8
+    assert "jumped" in report["last_issue"]
+    assert not report["stopped"]
 
 
 def test_the_report_counts_the_frames_it_produced(tmp_path):
@@ -176,6 +180,24 @@ def test_the_report_counts_the_frames_it_produced(tmp_path):
 
 def _reference(area, centroid=(60.0, 60.0)):
     return {"area": area, "centroid": centroid}
+
+
+def test_shape_drift_into_long_background_region_is_rejected():
+    mask = np.zeros(FRAME[::-1], dtype=bool)
+    mask[96:104, 20:180] = True
+
+    segmentation, reason = SAM3Tracker.evaluate_tracked_mask(
+        mask,
+        {
+            "area": 1280.0,
+            "centroid": (100.0, 100.0),
+            "source_elongation": 1.0,
+        },
+        FRAME,
+    )
+
+    assert segmentation is None
+    assert "elongated" in reason
 
 
 def test_gradual_change_is_accepted_and_a_single_jump_is_not():

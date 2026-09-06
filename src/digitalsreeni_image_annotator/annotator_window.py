@@ -4072,11 +4072,12 @@ class ImageAnnotator(QMainWindow):
         sam3_layout.addWidget(self.sam3_init_btn)
 
         self.sam3_stop_at_frame_gaps = QCheckBox(
-            "Stop at large filename gaps (optional)"
+            "Stop at large filename gaps (recommended)"
         )
-        self.sam3_stop_at_frame_gaps.setChecked(False)
+        self.sam3_stop_at_frame_gaps.setChecked(True)
         self.sam3_stop_at_frame_gaps.setToolTip(
-            "Use this only when one folder contains unrelated moments."
+            "Keeps tracking within nearby source frames so SAM 3 does not "
+            "jump to an unrelated object after a large gap."
         )
         sam3_layout.addWidget(self.sam3_stop_at_frame_gaps)
 
@@ -4090,7 +4091,7 @@ class ImageAnnotator(QMainWindow):
             "Stop before the next image when its filename frame number is "
             "farther away than this value."
         )
-        self.sam3_max_frame_gap.setEnabled(False)
+        self.sam3_max_frame_gap.setEnabled(True)
         self.sam3_stop_at_frame_gaps.toggled.connect(
             self.sam3_max_frame_gap.setEnabled
         )
@@ -4099,21 +4100,21 @@ class ImageAnnotator(QMainWindow):
         sam3_layout.addLayout(gap_layout)
 
         sam3_buttons_layout = QHBoxLayout()
-        self.sam3_track_forward_btn = QPushButton("2. Track Selected to End")
+        self.sam3_track_forward_btn = QPushButton("2. Track Selected Nearby")
         self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
         describe(
             self.sam3_track_forward_btn,
-            "Select one polygon in the annotation list, then predict its mask on "
-            "every later loaded frame. Tracking may stop if the object disappears "
-            "or the masks repeatedly stop looking right.",
+            "Select one polygon, then predict it across nearby loaded frames. "
+            "At a large filename gap, the app moves to the next frame so you "
+            "can draw a new seed.",
         )
-        self.sam3_track_all_btn = QPushButton("Track All Objects to End")
+        self.sam3_track_all_btn = QPushButton("Track All Objects Nearby")
         self.sam3_track_all_btn.clicked.connect(
             lambda: self.sam3_track_forward(all_objects=True)
         )
         describe(
             self.sam3_track_all_btn,
-            "Predict every valid polygon on this frame across all later loaded "
+            "Predict every valid polygon on this frame across nearby loaded "
             "frames. Your own labels are never overwritten \u2014 SAM 3 adds "
             "its masks alongside them, marked [SAM 3] for review.",
         )
@@ -4125,11 +4126,10 @@ class ImageAnnotator(QMainWindow):
 
         sam3_layout.addWidget(
             help_text(
-                "Start with a clean polygon on the current frame, and select "
-                "it. Tracking stops when the object leaves or the masks stop "
-                "looking right \u2014 the status bar says which. When it stops "
-                "early, go to the last good frame, redraw the polygon there "
-                "and track again from it. Tracked masks are dashed and tagged "
+                "Start with a clean polygon on the current frame and select it. "
+                "SAM 3 tracks through nearby source frames, then moves to the "
+                "first frame after a large gap for a new manual seed. "
+                "Tracked masks are dashed and tagged "
                 "[SAM 3]; click one and press Delete, or Shift+Delete to "
                 "clear the frame."
             )
@@ -9322,16 +9322,9 @@ class ImageAnnotator(QMainWindow):
             self.image_label.update()
             run_report = getattr(self.sam3_tracker, "last_run_report", None) or {}
             reached_gap = bool(following_name) and any(
-                info.get("last_frame") == run_end_idx
+                info.get("processed_through", info.get("last_frame")) == run_end_idx
                 for info in run_report.values()
             )
-            if reached_gap:
-                for info in run_report.values():
-                    if info.get("last_frame") == run_end_idx and not info.get("stopped"):
-                        info["stopped"] = (
-                            f"the next image is {source_gap} source frames away; "
-                            "a new manual mask is needed"
-                        )
             self._report_tracking_run(objects_to_track, tracked_annotation_count)
             if tracked_annotation_count:
                 if not saved:
@@ -9409,24 +9402,25 @@ class ImageAnnotator(QMainWindow):
         self.statusBar().showMessage(message, 20000)
 
     def _tracking_stop_notes(self, objects_to_track):
-        """Why each object stopped, in the words the tracker recorded.
-
-        A run that ends after nine frames of a sixty-frame clip used to
-        say nothing at all, so the only way to find out whether that was
-        the object leaving the frame or a gate being too strict was to
-        read the source. Re-seeding from the last good frame is the fix
-        for most of them, and that is only obvious once the reason is.
-        """
+        """Summarize hard stops and masks skipped by the quality checks."""
         report = getattr(self.sam3_tracker, "last_run_report", None) or {}
         notes = []
         for object_id, info in report.items():
-            if not info.get("stopped"):
-                continue
             class_name = (objects_to_track.get(object_id) or ("object", None))[0]
-            notes.append(
-                f"{class_name} stopped after {info['frames']} frame(s) \u2014 "
-                f"{info['stopped']}"
-            )
+            if info.get("stopped"):
+                notes.append(
+                    f"{class_name} stopped after {info['frames']} frame(s) \u2014 "
+                    f"{info['stopped']}"
+                )
+                continue
+            skipped = int(info.get("skipped", 0))
+            if skipped:
+                processed = info.get("processed_through")
+                last_issue = info.get("last_issue") or "uncertain mask"
+                notes.append(
+                    f"{class_name} checked through frame {processed} and skipped "
+                    f"{skipped} uncertain mask(s) (last: {last_issue})"
+                )
         return notes
 
     def remove_all_temp_annotations(self):
