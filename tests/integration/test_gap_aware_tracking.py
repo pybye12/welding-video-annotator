@@ -1,10 +1,12 @@
+import pytest
 from PyQt6.QtGui import QColor, QImage
 
 from digitalsreeni_image_annotator.annotator_window import ImageAnnotator
 from digitalsreeni_image_annotator.video_sequence import FrameSequence
 
 
-def test_tracking_stops_at_gap_and_moves_to_next_manual_seed(qtbot, tmp_path):
+@pytest.mark.parametrize("stop_at_gaps", [False, True])
+def test_tracking_gap_stop_is_optional(qtbot, tmp_path, stop_at_gaps):
     images_dir = tmp_path / "images"
     images_dir.mkdir()
     frame_paths = []
@@ -76,13 +78,21 @@ def test_tracking_stops_at_gap_and_moves_to_next_manual_seed(qtbot, tmp_path):
     window.auto_save = lambda: True
     messages = []
     window.show_info = lambda title, message: messages.append((title, message))
+    window.sam3_stop_at_frame_gaps.setChecked(stop_at_gaps)
 
     window.sam3_track_forward(all_objects=True)
 
-    assert tracker.limit == 2
+    assert tracker.limit == (2 if stop_at_gaps else 3)
     assert frame_paths[1].name in window.all_annotations
     assert frame_paths[2].name in window.all_annotations
-    assert frame_paths[3].name not in window.all_annotations
-    assert window.image_list.currentItem().text() == frame_paths[3].name
-    assert messages[-1][0] == "Manual Mask Needed"
-    assert "1525 source frames away" in messages[-1][1]
+    if stop_at_gaps:
+        assert frame_paths[3].name not in window.all_annotations
+        assert window.image_list.currentItem().text() == frame_paths[3].name
+        assert messages[-1][0] == "Manual Mask Needed"
+        assert "1525 source frames away" in messages[-1][1]
+    else:
+        assert frame_paths[3].name in window.all_annotations
+        assert window.image_list.currentItem().text() == frame_paths[1].name
+        assert not any(
+            title == "Manual Mask Needed" for title, _ in messages
+        )

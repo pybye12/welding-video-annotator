@@ -15,7 +15,7 @@ uploaded by the application.
 - Use SAM 2 point or box prompts for assisted image segmentation.
 - Open selected ranges from large videos without loading the full video into RAM.
 - Navigate extracted frames and preserve their original source-frame numbers.
-- Propagate a selected polygon through nearby frames with optional SAM 3 tracking.
+- Propagate a selected polygon through all later loaded frames with optional SAM 3 tracking.
 - Adjust preview brightness and contrast without changing source images or labels.
 - Save work as an `.iap` project and continue later.
 - Export COCO, YOLO segmentation, Pascal VOC, class-ID masks, or RGB masks.
@@ -147,10 +147,9 @@ checkpoint when prompted. Then:
 2. Draw a polygon on a clear starting frame.
 3. Click that polygon in the **Annotations** list.
 4. Open the **Auto-track** tab and click **1. Prepare Loaded Frames**.
-5. Keep **Maximum source-frame gap** at `60` unless the team agrees otherwise,
-   then click **2. Track Selected Nearby**.
-6. At a large frame-number gap, draw a fresh polygon where the app stops and
-   run nearby tracking again.
+5. Click **2. Track Selected to End**. SAM 3 attempts every later loaded frame.
+6. Leave **Stop at large filename gaps** off for a normal recording. Turn it on
+   only when one folder mixes unrelated moments.
 7. Review every generated mask and fix drift with the brush and eraser.
 
 If the app reports **No valid polygon annotations selected**, select the

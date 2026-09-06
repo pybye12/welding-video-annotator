@@ -4052,9 +4052,9 @@ class ImageAnnotator(QMainWindow):
 
         sam3_group, sam3_layout = group("Track through frames")
         sam3_scope = QLabel(
-            "Frames are sorted by the number at the end of their filename. "
-            "Tracking stops before a larger source-frame gap so unrelated "
-            "moments are not joined."
+            "SAM 3 attempts the selected object on every later loaded frame "
+            "in numeric filename order. Review its proposed masks before "
+            "exporting."
         )
         sam3_scope.setObjectName("sam3ScopeLabel")
         sam3_scope.setProperty("cardRole", "info")
@@ -4071,6 +4071,15 @@ class ImageAnnotator(QMainWindow):
         )
         sam3_layout.addWidget(self.sam3_init_btn)
 
+        self.sam3_stop_at_frame_gaps = QCheckBox(
+            "Stop at large filename gaps (optional)"
+        )
+        self.sam3_stop_at_frame_gaps.setChecked(False)
+        self.sam3_stop_at_frame_gaps.setToolTip(
+            "Use this only when one folder contains unrelated moments."
+        )
+        sam3_layout.addWidget(self.sam3_stop_at_frame_gaps)
+
         gap_layout = QHBoxLayout()
         gap_label = QLabel("Maximum source-frame gap")
         self.sam3_max_frame_gap = QSpinBox()
@@ -4081,26 +4090,30 @@ class ImageAnnotator(QMainWindow):
             "Stop before the next image when its filename frame number is "
             "farther away than this value."
         )
+        self.sam3_max_frame_gap.setEnabled(False)
+        self.sam3_stop_at_frame_gaps.toggled.connect(
+            self.sam3_max_frame_gap.setEnabled
+        )
         gap_layout.addWidget(gap_label)
         gap_layout.addWidget(self.sam3_max_frame_gap)
         sam3_layout.addLayout(gap_layout)
 
         sam3_buttons_layout = QHBoxLayout()
-        self.sam3_track_forward_btn = QPushButton("2. Track Selected Nearby")
+        self.sam3_track_forward_btn = QPushButton("2. Track Selected to End")
         self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
         describe(
             self.sam3_track_forward_btn,
             "Select one polygon in the annotation list, then predict its mask on "
-            "nearby later frames. Tracking stops at a large filename gap or when "
-            "the object disappears or the masks stop looking right.",
+            "every later loaded frame. Tracking may stop if the object disappears "
+            "or the masks repeatedly stop looking right.",
         )
-        self.sam3_track_all_btn = QPushButton("Track All Nearby")
+        self.sam3_track_all_btn = QPushButton("Track All Objects to End")
         self.sam3_track_all_btn.clicked.connect(
             lambda: self.sam3_track_forward(all_objects=True)
         )
         describe(
             self.sam3_track_all_btn,
-            "Predict every valid polygon on this frame across nearby later "
+            "Predict every valid polygon on this frame across all later loaded "
             "frames. Your own labels are never overwritten \u2014 SAM 3 adds "
             "its masks alongside them, marked [SAM 3] for review.",
         )
@@ -9211,25 +9224,30 @@ class ImageAnnotator(QMainWindow):
             self.show_warning("Tracking", message)
             return
 
-        max_frame_gap = self.sam3_max_frame_gap.value()
-        run_end_idx = self.frame_sequence.end_index_for_max_gap(
-            current_idx, max_frame_gap
-        )
-        following_name = self.frame_sequence.name_for_index(run_end_idx + 1)
-        source_gap = self.frame_sequence.source_gap_after(run_end_idx)
+        run_end_idx = len(self.frame_sequence.frames) - 1
+        following_name = None
+        source_gap = None
+        if self.sam3_stop_at_frame_gaps.isChecked():
+            max_frame_gap = self.sam3_max_frame_gap.value()
+            run_end_idx = self.frame_sequence.end_index_for_max_gap(
+                current_idx, max_frame_gap
+            )
+            following_name = self.frame_sequence.name_for_index(run_end_idx + 1)
+            source_gap = self.frame_sequence.source_gap_after(run_end_idx)
+
         if run_end_idx == current_idx:
             if following_name:
                 self.show_info(
                     "Manual Mask Needed",
                     f"The next image is {source_gap} source frames away. "
                     f"Moved to {following_name}. Draw a new polygon there, "
-                    "then track nearby again.",
+                    "then continue tracking.",
                 )
                 self._navigate_to_image_or_slice(following_name)
             else:
                 self.show_warning(
                     "Tracking",
-                    "There are no nearby later frames to track from this image.",
+                    "There are no later loaded frames to track from this image.",
                 )
             return
 
