@@ -183,6 +183,7 @@ def test_tracker_uses_source_polygon_as_normalized_prompt(tmp_path):
         2,
         [(7, [2, 2, 12, 2, 12, 12, 2, 12])],
         (20, 20),
+        max_frame_num_to_track=4,
     )
 
     prompt = predictor.requests[2]
@@ -192,6 +193,11 @@ def test_tracker_uses_source_polygon_as_normalized_prompt(tmp_path):
     assert prompt["point_labels"].count(0) == 8
     assert all(0 <= coordinate <= 1 for point in prompt["points"] for coordinate in point)
     assert set(results[0][1]) == {7}
+    propagate = next(
+        request for request in predictor.requests
+        if request["type"] == "propagate_in_video"
+    )
+    assert propagate["max_frame_num_to_track"] == 4
 
 
 def test_tracker_uses_exact_polygon_mask_when_meta_api_is_available(tmp_path):

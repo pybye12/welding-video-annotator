@@ -15,7 +15,7 @@ uploaded by the application.
 - Use SAM 2 point or box prompts for assisted image segmentation.
 - Open selected ranges from large videos without loading the full video into RAM.
 - Navigate extracted frames and preserve their original source-frame numbers.
-- Propagate a selected polygon through later frames with optional SAM 3 tracking.
+- Propagate a selected polygon through nearby frames with optional SAM 3 tracking.
 - Adjust preview brightness and contrast without changing source images or labels.
 - Save work as an `.iap` project and continue later.
 - Export COCO, YOLO segmentation, Pascal VOC, class-ID masks, or RGB masks.
@@ -93,8 +93,8 @@ sreeni
 ## Basic Labeling Workflow
 
 1. Create a project and save the `.iap` file.
-2. Click **Add New Images**, or use **Video > Open Video Clip** to choose a
-   manageable frame range from a video.
+2. Click **Open Frame Folder** to load one recording folder, **Add New Images**
+   for selected stills, or use **Video > Open Video Clip** for a video range.
 3. Add your own classes, or choose a preset from the **Welding** menu.
 4. Select a class and draw labels with **Polygon**, **Paint Brush**, or another
    annotation tool. Press **Enter** to finish a polygon.
@@ -142,12 +142,16 @@ SAM 3 tracking additionally requires:
 Place a checkpoint named `sam3-001.pt` in the repository root, or select the
 checkpoint when prompted. Then:
 
-1. Draw a polygon on a clear starting frame.
-2. Click that polygon in the **Annotations** list.
-3. Open the **Auto-track** tab.
-4. Click **1. Prepare Loaded Frames**.
-5. Click **2. Track Selected to End**.
-6. Review all generated masks and fix drift with the manual tools.
+1. Open one recording folder with **Open Frame Folder**. Numeric frame suffixes
+   such as `_f000089` are placed in ascending source-frame order.
+2. Draw a polygon on a clear starting frame.
+3. Click that polygon in the **Annotations** list.
+4. Open the **Auto-track** tab and click **1. Prepare Loaded Frames**.
+5. Keep **Maximum source-frame gap** at `60` unless the team agrees otherwise,
+   then click **2. Track Selected Nearby**.
+6. At a large frame-number gap, draw a fresh polygon where the app stops and
+   run nearby tracking again.
+7. Review every generated mask and fix drift with the brush and eraser.
 
 If the app reports **No valid polygon annotations selected**, select the
 finished polygon row in the Annotations panel before tracking.

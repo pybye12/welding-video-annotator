@@ -724,3 +724,83 @@ def test_frame_keys_fire_when_the_main_window_is_active(qtbot):
     window._trigger_video_shortcut(lambda: called.append(True))
 
     assert called == [True]
+
+
+# --- Drawing an outline that crosses itself -------------------------------
+
+
+def test_finishing_a_self_crossing_polygon_does_not_close_the_app(qtbot):
+    """The crash: shapely raises, PyQt aborts, the window disappears.
+
+    Reported from the field as ``TopologyException: side location
+    conflict`` while labelling — the outline only has to touch its own
+    edge once while tracing spatter. The outline is now repaired into
+    the shape the annotator was drawing rather than rejected, so the
+    work is kept as well as the app.
+    """
+    from PyQt6.QtGui import QImage
+    from shapely.geometry import Polygon
+
+    window = _window(qtbot)
+    window.current_image = QImage(960, 960, QImage.Format.Format_RGB888)
+    window.current_class = "droplet"
+    window.class_mapping["droplet"] = 1
+    window.image_label.current_tool = "polygon"
+    window.image_label.current_annotation = [
+        (400, 600),
+        (500, 600),
+        (400, 650),
+        (500, 650),
+    ]
+
+    window.finish_polygon()  # used to raise GEOSException and abort
+
+    saved = window.image_label.annotations["droplet"]
+    assert len(saved) == 1
+    points = saved[0]["segmentation"]
+    repaired = Polygon(list(zip(points[0::2], points[1::2])))
+    assert repaired.is_valid, "a saved annotation must be a usable shape"
+    assert repaired.area > 0
+    assert window.image_label.current_annotation == []
+
+
+def test_an_unusable_outline_is_reported_rather_than_saved(qtbot, monkeypatch):
+    """Drawn entirely off the image: nothing to keep, so say so."""
+    from PyQt6.QtGui import QImage
+    from PyQt6.QtWidgets import QMessageBox
+
+    window = _window(qtbot)
+    window.current_image = QImage(960, 960, QImage.Format.Format_RGB888)
+    window.current_class = "droplet"
+    window.class_mapping["droplet"] = 1
+    window.image_label.current_tool = "polygon"
+    window.image_label.current_annotation = [(-99, -99), (-50, -99), (-50, -50)]
+
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[2])
+    )
+
+    window.finish_polygon()
+
+    assert warnings and "cross itself" in warnings[0]
+    assert not window.image_label.annotations.get("droplet")
+    assert window.image_label.drawing_polygon is False
+
+
+def test_an_ordinary_polygon_still_saves(qtbot):
+    """The guard must not cost the normal path anything."""
+    from PyQt6.QtGui import QImage
+
+    window = _window(qtbot)
+    window.current_image = QImage(960, 960, QImage.Format.Format_RGB888)
+    window.current_class = "droplet"
+    window.class_mapping["droplet"] = 1
+    window.image_label.current_tool = "polygon"
+    window.image_label.current_annotation = [(10, 10), (110, 10), (110, 110), (10, 110)]
+
+    window.finish_polygon()
+
+    saved = window.image_label.annotations["droplet"]
+    assert len(saved) == 1
+    assert len(saved[0]["segmentation"]) >= 8

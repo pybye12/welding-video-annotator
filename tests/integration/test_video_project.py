@@ -475,8 +475,15 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
             self.window_enabled_during_tracking = None
             self.canvas_enabled_during_tracking = None
 
-        def track_polygons(self, frame_index, polygons, _frame_size):
+        def track_polygons(
+            self,
+            frame_index,
+            polygons,
+            _frame_size,
+            max_frame_num_to_track=None,
+        ):
             self.polygons = (frame_index, polygons)
+            self.max_frame_num_to_track = max_frame_num_to_track
             self.window_enabled_during_tracking = self.window.isEnabled()
             self.canvas_enabled_during_tracking = self.window.image_label.isEnabled()
             return [
@@ -545,6 +552,7 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
     window.sam3_track_forward(all_objects=True)
 
     assert tracker.polygons[0] == 0
+    assert tracker.max_frame_num_to_track == 3
     assert tracker.window_enabled_during_tracking is False
     assert tracker.canvas_enabled_during_tracking is False
     assert window.isEnabled()

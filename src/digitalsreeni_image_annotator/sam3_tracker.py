@@ -21,12 +21,41 @@ class SAM3Tracker:
 
     MIN_TRACKED_AREA = 50.0
     MIN_SOURCE_AREA_RATIO = 0.15
+
+    # SAM returned no mask at all: the object has left the frame or merged
+    # into the pool. Give up quickly — continuing risks re-using this
+    # object's id for whatever appears next.
     MAX_CONSECUTIVE_MISSES = 2
+
+    # SAM returned a mask and our own gates rejected it. Be slower to give
+    # up here: the gates are heuristics, and two unlucky frames (an arc
+    # flash, a moment of occlusion) should not end a run that is otherwise
+    # tracking correctly.
+    MAX_CONSECUTIVE_REJECTIONS = 5
+
+    # How much the tracked area may change from the *previous accepted*
+    # frame. A droplet necking down and detaching changes size gradually,
+    # so a per-frame limit lets it shrink to any size over enough frames
+    # while a single catastrophic jump is still refused.
+    MAX_AREA_STEP = 4.0
+
+    # A mask may never cover more than this fraction of the frame.
+    MAX_FRAME_FRACTION = 0.5
+
+    # How far the mask's centre may travel in one frame, as a fraction of
+    # the frame diagonal. This is what catches drift onto the background
+    # plate: the size gates alone cannot tell a plausible blob in the
+    # wrong place from the right one.
+    MAX_CENTROID_STEP_FRACTION = 0.25
 
     def __init__(self, checkpoint_path, predictor=None):
         self.checkpoint_path = checkpoint_path
         self.predictor = predictor
         self.session_id = None
+        # Filled in by track_polygons: per object, how many frames it
+        # produced and why it stopped. Read by the window so a short run
+        # can explain itself instead of going quiet.
+        self.last_run_report = {}
         if self.predictor is None:
             self._load_predictor()
 
@@ -286,7 +315,13 @@ class SAM3Tracker:
                 results.append((response["frame_index"], segmentations_by_object))
         return results
 
-    def track_polygons(self, frame_idx, object_polygons, frame_size):
+    def track_polygons(
+        self,
+        frame_idx,
+        object_polygons,
+        frame_size,
+        max_frame_num_to_track=None,
+    ):
         """Initialize objects from exact polygons and propagate forward.
 
         Each output object is reduced to its largest connected component.
@@ -345,41 +380,109 @@ class SAM3Tracker:
                 "propagation_direction": "forward",
                 "start_frame_index": frame_idx,
             }
+            if max_frame_num_to_track is not None:
+                request["max_frame_num_to_track"] = max_frame_num_to_track
             results = []
             active_object_ids = set(source_areas)
             consecutive_misses = {object_id: 0 for object_id in source_areas}
+            consecutive_rejections = {object_id: 0 for object_id in source_areas}
+            # Each object's last accepted frame, which every later frame is
+            # judged against. Seeded from the drawn polygon.
+            references = {
+                object_id: {
+                    "area": source_areas[object_id],
+                    "centroid": self._mask_centroid(source_masks[object_id]),
+                }
+                for object_id in source_areas
+            }
+            report = {
+                object_id: {"frames": 0, "last_frame": None, "stopped": ""}
+                for object_id in source_areas
+            }
+            self.last_run_report = report
+
             for response in self.predictor.handle_stream_request(request):
+                frame_index = response["frame_index"]
                 segmentations_by_object = {}
                 masks_by_object = self.extract_masks_from_outputs(response["outputs"])
                 for object_id in list(active_object_ids):
                     mask = masks_by_object.get(object_id)
-                    segmentation = (
-                        self.largest_plausible_segmentation(
-                            mask, source_areas[object_id], frame_area
+
+                    if frame_index == frame_idx:
+                        # The prompt frame. The polygon the annotator drew
+                        # is the right answer here, so keep the strict
+                        # source-anchored gate: a mask that disagrees with
+                        # it means the prompt itself failed.
+                        segmentation = (
+                            self.largest_plausible_segmentation(
+                                mask, source_areas[object_id], frame_area
+                            )
+                            if mask is not None
+                            else None
                         )
-                        if mask is not None
-                        else None
-                    )
-                    if response["frame_index"] == frame_idx and (
-                        not segmentation
-                        or self.segmentation_overlap_ratio(
+                        if not segmentation or self.segmentation_overlap_ratio(
                             segmentation, source_masks[object_id]
-                        )
-                        < 0.1
-                    ):
-                        active_object_ids.discard(object_id)
+                        ) < 0.1:
+                            active_object_ids.discard(object_id)
+                            report[object_id]["stopped"] = (
+                                "SAM 3 could not reproduce the polygon on the "
+                                "frame it was given"
+                            )
+                            continue
+                        segmentations_by_object[object_id] = [segmentation]
                         continue
+
+                    if mask is None:
+                        segmentation, reason = None, "no mask"
+                    else:
+                        segmentation, reason = self.evaluate_tracked_mask(
+                            mask, references[object_id], frame_size
+                        )
+
                     if segmentation:
                         consecutive_misses[object_id] = 0
+                        consecutive_rejections[object_id] = 0
+                        contour = np.asarray(segmentation, dtype=np.float32).reshape(
+                            -1, 2
+                        )
+                        references[object_id] = {
+                            "area": float(cv2.contourArea(contour)),
+                            "centroid": self.contour_centroid(
+                                contour.astype(np.int32)
+                            ),
+                        }
                         segmentations_by_object[object_id] = [segmentation]
-                    else:
+                        report[object_id]["frames"] += 1
+                        report[object_id]["last_frame"] = frame_index
+                        continue
+
+                    # Two different kinds of failure, with different
+                    # tolerances: "SAM found nothing" means the object is
+                    # gone, while "our gate said no" may just mean the
+                    # gate is wrong about one awkward frame.
+                    if reason == "no mask":
                         consecutive_misses[object_id] += 1
                         if (
                             consecutive_misses[object_id]
                             >= self.MAX_CONSECUTIVE_MISSES
                         ):
                             active_object_ids.discard(object_id)
-                results.append((response["frame_index"], segmentations_by_object))
+                            report[object_id]["stopped"] = (
+                                f"SAM 3 found nothing on "
+                                f"{self.MAX_CONSECUTIVE_MISSES} frames in a row"
+                            )
+                    else:
+                        consecutive_rejections[object_id] += 1
+                        if (
+                            consecutive_rejections[object_id]
+                            >= self.MAX_CONSECUTIVE_REJECTIONS
+                        ):
+                            active_object_ids.discard(object_id)
+                            report[object_id]["stopped"] = (
+                                f"{self.MAX_CONSECUTIVE_REJECTIONS} masks in a "
+                                f"row looked wrong (last: {reason})"
+                            )
+                results.append((frame_index, segmentations_by_object))
                 if not active_object_ids:
                     break
         return results
@@ -532,9 +635,113 @@ class SAM3Tracker:
         cv2.fillPoly(mask, [np.rint(points).astype(np.int32)], 1)
         return mask
 
+    @staticmethod
+    def _mask_centroid(mask):
+        """Centre of mass of a binary mask, or None when it is empty."""
+        moments = cv2.moments((np.asarray(mask) > 0).astype(np.uint8), binaryImage=True)
+        if not moments["m00"]:
+            return None
+        return (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
+
+    @staticmethod
+    def _largest_contour(mask):
+        """Biggest external contour of a mask, with its area, or None."""
+        binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            binary_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        contours = [contour for contour in contours if len(contour) >= 3]
+        if not contours:
+            return None, 0.0
+        largest = max(contours, key=cv2.contourArea)
+        return largest, float(cv2.contourArea(largest))
+
+    @staticmethod
+    def contour_centroid(contour):
+        """Centre of mass of a contour, falling back to its bounding box."""
+        moments = cv2.moments(contour)
+        if moments["m00"]:
+            return (
+                moments["m10"] / moments["m00"],
+                moments["m01"] / moments["m00"],
+            )
+        x, y, width, height = cv2.boundingRect(contour)
+        return (x + width / 2.0, y + height / 2.0)
+
+    @classmethod
+    def evaluate_tracked_mask(cls, mask, reference, frame_size):
+        """Accept or reject one propagated mask, against the last good one.
+
+        The gates are relative to the *previous accepted frame*, not to
+        the polygon the annotator drew. Anchoring to the source made a
+        real physical change — a droplet necking down before it detaches
+        — indistinguishable from drift, so tracking gave up part way
+        through exactly the event being studied. Comparing frame to
+        frame instead allows any amount of gradual change while still
+        refusing a single implausible jump.
+
+        ``reference`` is ``{"area": float, "centroid": (x, y)}`` from the
+        last accepted frame. Returns ``(segmentation | None, reason)``;
+        ``reason`` is empty when the mask was accepted and otherwise says
+        in plain words why it was not, so a run that stops early can
+        explain itself.
+        """
+        frame_width, frame_height = frame_size
+        frame_area = float(frame_width) * float(frame_height)
+        contour, area = cls._largest_contour(mask)
+        if contour is None:
+            return None, "no mask"
+
+        if area < cls.MIN_TRACKED_AREA:
+            return None, f"only {int(area)} px, below the {int(cls.MIN_TRACKED_AREA)} px floor"
+        if area > frame_area * cls.MAX_FRAME_FRACTION:
+            return None, "covered more than half the frame"
+
+        reference_area = float(reference["area"])
+        if reference_area > 0:
+            if area > reference_area * cls.MAX_AREA_STEP:
+                return None, (
+                    f"grew {area / reference_area:.1f}x in one frame"
+                )
+            if area * cls.MAX_AREA_STEP < reference_area:
+                return None, (
+                    f"shrank to 1/{reference_area / max(area, 1.0):.1f} in one frame"
+                )
+
+        centroid = cls.contour_centroid(contour)
+        previous = reference.get("centroid")
+        if previous is not None:
+            travelled = float(
+                np.hypot(centroid[0] - previous[0], centroid[1] - previous[1])
+            )
+            diagonal = float(np.hypot(frame_width, frame_height))
+            # A plain fraction of the frame, with no term scaling to the
+            # object's own size. An earlier version added ``4 * sqrt(area)``
+            # so a small droplet could move several of its own widths —
+            # but for a large object that term reached 240 px in a 200 px
+            # frame and swallowed the check entirely, which is exactly the
+            # drift this is here to catch. A quarter of the diagonal is
+            # already far more travel than one frame of welding video
+            # shows, small object or not.
+            allowance = diagonal * cls.MAX_CENTROID_STEP_FRACTION
+            if travelled > allowance:
+                return None, (
+                    f"jumped {int(travelled)} px across the frame in one step"
+                )
+
+        return contour.flatten().tolist(), ""
+
     @classmethod
     def largest_plausible_segmentation(cls, mask, source_area, frame_area):
-        """Return the largest geometrically plausible tracked component."""
+        """Source-frame gate: strict, and anchored to the drawn polygon.
+
+        Used only on the frame the annotator prompted from, where the
+        polygon they drew *is* the right answer and a mask that differs
+        wildly from it means the prompt failed. Propagated frames go
+        through ``evaluate_tracked_mask`` instead.
+        """
         binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
         contours, _ = cv2.findContours(
             binary_mask,

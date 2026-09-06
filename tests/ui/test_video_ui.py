@@ -14,19 +14,22 @@ def test_video_menu_and_sam_controls_render(qtbot):
 
     assert "Open Video &Clip..." in action_labels
     assert window.sam3_init_btn.text() == "1. Prepare Loaded Frames"
-    assert window.sam3_track_forward_btn.text() == "2. Track Selected to End"
-    assert window.sam3_track_all_btn.text() == "Track All to End"
+    assert window.sam3_track_forward_btn.text() == "2. Track Selected Nearby"
+    assert window.sam3_track_all_btn.text() == "Track All Nearby"
     assert window.sam3_init_btn.property("buttonRole") == "primary"
     assert "Images list" in window.sam3_init_btn.toolTip()
-    assert "later loaded frames" in window.sam3_track_forward_btn.toolTip()
-    assert "two consecutive misses" in window.sam3_track_forward_btn.toolTip()
-    assert "Existing manual annotations are preserved" in (
+    assert "nearby later frames" in window.sam3_track_forward_btn.toolTip()
+    assert "object disappears" in window.sam3_track_forward_btn.toolTip()
+    assert "never overwritten" in (
         window.sam3_track_all_btn.toolTip()
     )
     assert window.sam3_init_btn.statusTip() == window.sam3_init_btn.toolTip()
     assert window.sam3_init_btn.accessibleDescription() == (
         window.sam3_init_btn.toolTip()
     )
+    assert window.open_frame_folder_button.text() == "Open Frame Folder..."
+    assert window.sam3_max_frame_gap.value() == 60
+    assert window.sam3_max_frame_gap.suffix() == " frames"
 
 
 def test_dino_review_shortcuts_are_consumed_while_sam3_is_busy(qtbot):

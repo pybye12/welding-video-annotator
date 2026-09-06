@@ -89,4 +89,6 @@ def test_sidebar_exposes_common_loading_and_welding_actions(qtbot):
     ai_hint = window.findChild(QLabel, "aiWorkflowHint")
     sam3_scope = window.findChild(QLabel, "sam3ScopeLabel")
     assert ai_hint is not None and "TRACK ACROSS FRAMES" in ai_hint.text()
-    assert sam3_scope is not None and "loaded in the Images list" in sam3_scope.text()
+    assert sam3_scope is not None
+    assert "sorted by the number" in sam3_scope.text()
+    assert "source-frame gap" in sam3_scope.text()

@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -114,6 +115,13 @@ from .slice_registration import SliceRegistrationTool
 from .snake_game import SnakeGame
 from .soft_dark_stylesheet import soft_dark_stylesheet
 from .annotation_history import AnnotationHistory
+from .annotation_source import (
+    count_ai_annotations,
+    frame_has_ai_annotations,
+    is_ai_generated,
+    manual_classes,
+    source_label,
+)
 from .shortcuts import ShortcutReferenceDialog
 from .theme import build_stylesheet, tokens_for
 from .stack_interpolator import StackInterpolator
@@ -152,6 +160,66 @@ def redo_shortcut_sequences(standard_redo):
         if candidate not in sequences:
             sequences.append(candidate)
     return sequences
+
+
+def clip_drawn_shape(points, width, height):
+    """Turn raw drawn points into a valid polygon clipped to the image.
+
+    Shapely refuses to intersect a self-intersecting polygon: it raises
+    ``TopologyException: side location conflict`` and, because PyQt
+    aborts the process on an unhandled exception inside a slot, the app
+    disappears rather than reporting anything. A trace that doubles back
+    on itself is trivially easy to draw when outlining spatter, so the
+    polygon has to be repaired before it is used, not assumed sound.
+
+    ``make_valid`` splits a self-crossing outline into its separate
+    lobes; the largest is what the annotator was drawing, and the little
+    slivers left by a stray crossing are noise. Returns None when
+    nothing usable survives.
+    """
+    try:
+        polygon = Polygon(points)
+    except (ValueError, TypeError):
+        return None
+    if not polygon.is_valid:
+        polygon = make_valid(polygon)
+    polygon = largest_polygon_part(polygon)
+    if polygon is None:
+        return None
+
+    boundary = Polygon([(0, 0), (width, 0), (width, height), (0, height)])
+    try:
+        clipped = polygon.intersection(boundary)
+    except shapely.errors.GEOSException:
+        # make_valid has already run, so reaching here means shapely
+        # cannot work with this outline at all. Losing one bad shape
+        # beats taking the whole session down with it.
+        return None
+    return largest_polygon_part(clipped)
+
+
+def largest_polygon_part(geometry):
+    """The biggest polygonal piece of any geometry, or None.
+
+    ``make_valid`` and ``intersection`` can both hand back a
+    MultiPolygon or a GeometryCollection holding stray lines and points
+    alongside the real shape, and only polygons with area are usable as
+    an annotation.
+    """
+    if geometry is None or geometry.is_empty:
+        return None
+    if isinstance(geometry, Polygon):
+        candidates = [geometry]
+    elif isinstance(geometry, MultiPolygon):
+        candidates = list(geometry.geoms)
+    elif hasattr(geometry, "geoms"):
+        candidates = [g for g in geometry.geoms if isinstance(g, Polygon)]
+    else:
+        return None
+    candidates = [p for p in candidates if not p.is_empty and p.area > 0]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda part: part.area)
 
 
 def _canonical_image_name(name):
@@ -473,6 +541,11 @@ class ImageAnnotator(QMainWindow):
         # consumers don't each carry a `hasattr` check (one forgotten
         # check would crash with AttributeError).
         self.dino_batch_results: dict[str, list] = {}
+
+        # Pre-run state of each frame a tracking run touches, collected
+        # while the run writes so it can report where its masks landed on
+        # top of existing manual work. Reset at the start of every run.
+        self._sam3_run_snapshots: dict = {}
 
         # Per-frame undo/redo over annotation snapshots. See
         # annotation_history.py for why this snapshots rather than
@@ -2441,7 +2514,14 @@ class ImageAnnotator(QMainWindow):
 
         # F2 (Snake game) is wired as a global QShortcut in __init__
         # so it works when child widgets have focus. Don't re-handle here.
-        if event.key() == Qt.Key.Key_Delete:
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and event.modifiers() == Qt.KeyboardModifier.ShiftModifier
+        ):
+            # Must be tested before plain Delete below, which matches the
+            # key regardless of modifiers and would swallow this.
+            self.clear_ai_annotations_on_frame()
+        elif event.key() == Qt.Key.Key_Delete:
             # Handle deletions
             if self.class_list.hasFocus() and self.class_list.currentItem():
                 self.delete_class(self.class_list.currentItem())
@@ -2451,6 +2531,17 @@ class ImageAnnotator(QMainWindow):
                 self.delete_selected_annotations()
             elif self.image_list.hasFocus() and self.image_list.currentItem():
                 self.delete_selected_image()
+            elif self.has_annotation_selection():
+                # Reached when the canvas has focus, which is where it
+                # is after clicking a polygon. Deleting a bad tracked
+                # mask should not require tabbing to the list first.
+                self.delete_selected_annotations()
+        elif event.key() == Qt.Key.Key_Backspace:
+            # Backspace only ever deletes annotations. Binding it to the
+            # class and frame lists as well would put "remove this
+            # frame" one stray keystroke away.
+            if self.has_annotation_selection():
+                self.delete_selected_annotations()
         elif event.key() == Qt.Key.Key_A:
             self.go_to_previous_frame()
         elif event.key() == Qt.Key.Key_D:
@@ -2997,6 +3088,41 @@ class ImageAnnotator(QMainWindow):
             self.update_annotation_list(image_name)
         self.update_annotation_list()  # Update for the current image/slice
 
+    def _annotation_list_item(self, class_name, annotation):
+        """Build one annotation row, tagged with where it came from.
+
+        Both list builders go through here so a model-generated mask can
+        never look like a hand-drawn one in only one of them. The tag
+        reads off the ``source`` key the generator already wrote, so
+        nothing about the saved project format changes.
+        """
+        number = annotation.get("number", 0)
+        area = calculate_area(annotation)
+        item_text = f"{class_name} - {number:<3} Area: {area:.2f}"
+        tag = source_label(annotation)
+        if tag:
+            item_text = f"{item_text}   [{tag}]"
+        item = QListWidgetItem(item_text)
+        item.setData(Qt.ItemDataRole.UserRole, annotation)
+        color = self.image_label.class_colors.get(
+            class_name, QColor(Qt.GlobalColor.white)
+        )
+        item.setForeground(color)
+        if tag:
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            origin = annotation.get("sam3_source_frame")
+            item.setToolTip(
+                f"Generated by {tag}"
+                + (f" from {origin}" if origin else "")
+                + ". Review it before export \u2014 select it and press "
+                "Delete to remove it."
+            )
+        else:
+            item.setToolTip("Drawn by hand.")
+        return item
+
     def update_annotation_list(self, image_name=None):
         self.annotation_list.clear()
         current_name = image_name or self.current_slice or self.image_file_name
@@ -3005,15 +3131,10 @@ class ImageAnnotator(QMainWindow):
             if not class_name.startswith(
                 "Temp-"
             ):  # Only show non-temporary annotations
-                color = self.image_label.class_colors.get(class_name, QColor(Qt.GlobalColor.white))
                 for annotation in class_annotations:
-                    number = annotation.get("number", 0)
-                    area = calculate_area(annotation)
-                    item_text = f"{class_name} - {number:<3} Area: {area:.2f}"
-                    item = QListWidgetItem(item_text)
-                    item.setData(Qt.ItemDataRole.UserRole, annotation)
-                    item.setForeground(color)
-                    self.annotation_list.addItem(item)
+                    self.annotation_list.addItem(
+                        self._annotation_list_item(class_name, annotation)
+                    )
 
         # Force the annotation list to repaint
         self.annotation_list.repaint()
@@ -3603,6 +3724,13 @@ class ImageAnnotator(QMainWindow):
             side_by_side(self.add_images_button, self.open_video_button)
         )
 
+        self.open_frame_folder_button = QPushButton("Open Frame Folder...")
+        self.open_frame_folder_button.clicked.connect(self.open_frame_folder)
+        self.open_frame_folder_button.setToolTip(
+            "Load every supported image directly inside one recording folder, "
+            "in numeric frame order. Use one recording folder at a time."
+        )
+        data_layout.addWidget(self.open_frame_folder_button)
         self.cavitar_preset_button = QPushButton("Droplets only")
         self.cavitar_preset_button.clicked.connect(
             self.add_cavitar_welding_classes
@@ -3771,7 +3899,16 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(manual_group)
 
-        annotations_group, annotations_layout = group("This frame")
+        annotations_group, annotations_layout = group("Annotations on this frame")
+        # "the frame is selected" and "a polygon is selected" are
+        # different states that drive different buttons, and confusing
+        # them is what makes "No valid polygon annotations selected"
+        # look like a bug. This line names the one that is easy to miss.
+        self.annotation_selection_label = QLabel("No annotations on this frame")
+        self.annotation_selection_label.setProperty("cardRole", "info")
+        self.annotation_selection_label.setWordWrap(True)
+        annotations_layout.addWidget(self.annotation_selection_label)
+
         self.annotation_list = QListWidget()
         self.annotation_list.setMinimumHeight(110)
         self.annotation_list.setMaximumHeight(150)
@@ -3780,6 +3917,13 @@ class ImageAnnotator(QMainWindow):
         )
         self.annotation_list.itemSelectionChanged.connect(
             self.update_highlighted_annotations
+        )
+        self.annotation_list.itemSelectionChanged.connect(
+            self.update_selection_readout
+        )
+        self.annotation_list.setToolTip(
+            "Polygons on the frame you are viewing. Click one here or on "
+            "the canvas to select it; [SAM 3] marks a tracked mask."
         )
         annotations_layout.addWidget(self.annotation_list)
 
@@ -3798,9 +3942,34 @@ class ImageAnnotator(QMainWindow):
         self.merge_button.clicked.connect(self.merge_annotations)
         self.change_class_button = QPushButton("Change Class")
         self.change_class_button.clicked.connect(self.change_annotation_class)
+        # Three buttons do not fit this sidebar: Qt clips a QPushButton
+        # label rather than eliding it, so "Change Class" rendered as
+        # "hange Clas". Delete is also the button a review pass presses
+        # most, so it earns the full-width row.
+        describe(
+            self.delete_button,
+            "Remove the selected annotation(s). Delete or Backspace does "
+            "the same thing, and Ctrl+Z puts them back.",
+        )
+        self.clear_ai_button = QPushButton("Clear AI masks")
+        self.clear_ai_button.setProperty("buttonRole", "danger")
+        self.clear_ai_button.setEnabled(False)
+        self.clear_ai_button.clicked.connect(self.clear_ai_annotations_on_frame)
         annotations_layout.addLayout(
-            side_by_side(
-                self.delete_button, self.merge_button, self.change_class_button
+            side_by_side(self.delete_button, self.clear_ai_button)
+        )
+        annotations_layout.addLayout(
+            side_by_side(self.merge_button, self.change_class_button)
+        )
+        # The panel that owns these keys names them, the way the drawing
+        # panel above names P / R / B / E. Shift+Delete is the one nobody
+        # would guess, and it is the whole review loop.
+        annotations_layout.addWidget(
+            help_text(
+                "Click a polygon on the canvas or here to select it. "
+                "Delete or Backspace removes the selection. "
+                "Shift+Delete clears every [SAM 3] mask on this frame and "
+                "keeps the ones you drew. Ctrl+Z undoes either."
             )
         )
         labeling_layout.addWidget(annotations_group)
@@ -3883,8 +4052,9 @@ class ImageAnnotator(QMainWindow):
 
         sam3_group, sam3_layout = group("Track through frames")
         sam3_scope = QLabel(
-            "Tracks from the current frame to the end of the frames currently "
-            "loaded in the Images list."
+            "Frames are sorted by the number at the end of their filename. "
+            "Tracking stops before a larger source-frame gap so unrelated "
+            "moments are not joined."
         )
         sam3_scope.setObjectName("sam3ScopeLabel")
         sam3_scope.setProperty("cardRole", "info")
@@ -3901,34 +4071,60 @@ class ImageAnnotator(QMainWindow):
         )
         sam3_layout.addWidget(self.sam3_init_btn)
 
+        gap_layout = QHBoxLayout()
+        gap_label = QLabel("Maximum source-frame gap")
+        self.sam3_max_frame_gap = QSpinBox()
+        self.sam3_max_frame_gap.setRange(1, 1_000_000)
+        self.sam3_max_frame_gap.setValue(60)
+        self.sam3_max_frame_gap.setSuffix(" frames")
+        self.sam3_max_frame_gap.setToolTip(
+            "Stop before the next image when its filename frame number is "
+            "farther away than this value."
+        )
+        gap_layout.addWidget(gap_label)
+        gap_layout.addWidget(self.sam3_max_frame_gap)
+        sam3_layout.addLayout(gap_layout)
+
         sam3_buttons_layout = QHBoxLayout()
-        self.sam3_track_forward_btn = QPushButton("2. Track Selected to End")
+        self.sam3_track_forward_btn = QPushButton("2. Track Selected Nearby")
         self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
         describe(
             self.sam3_track_forward_btn,
             "Select one polygon in the annotation list, then predict its mask on "
-            "later loaded frames. Tracking stops after two consecutive misses.",
+            "nearby later frames. Tracking stops at a large filename gap or when "
+            "the object disappears or the masks stop looking right.",
         )
-        self.sam3_track_all_btn = QPushButton("Track All to End")
+        self.sam3_track_all_btn = QPushButton("Track All Nearby")
         self.sam3_track_all_btn.clicked.connect(
             lambda: self.sam3_track_forward(all_objects=True)
         )
         describe(
             self.sam3_track_all_btn,
-            "Predict every valid polygon on this frame across later loaded frames. "
-            "Existing manual annotations are preserved.",
+            "Predict every valid polygon on this frame across nearby later "
+            "frames. Your own labels are never overwritten \u2014 SAM 3 adds "
+            "its masks alongside them, marked [SAM 3] for review.",
         )
+        self._track_forward_help = self.sam3_track_forward_btn.toolTip()
+        self._track_all_help = self.sam3_track_all_btn.toolTip()
         sam3_buttons_layout.addWidget(self.sam3_track_forward_btn)
         sam3_buttons_layout.addWidget(self.sam3_track_all_btn)
         sam3_layout.addLayout(sam3_buttons_layout)
+
         sam3_layout.addWidget(
             help_text(
-                "Start with a clean polygon on the current frame. SAM 3 follows it "
-                "forward until the sequence ends or the object is missed twice. "
-                "Correct mistakes in Labeling before export."
+                "Start with a clean polygon on the current frame, and select "
+                "it. Tracking stops when the object leaves or the masks stop "
+                "looking right \u2014 the status bar says which. When it stops "
+                "early, go to the last good frame, redraw the polygon there "
+                "and track again from it. Tracked masks are dashed and tagged "
+                "[SAM 3]; click one and press Delete, or Shift+Delete to "
+                "clear the frame."
             )
         )
         ai_layout.addWidget(sam3_group)
+        # Reflect "no frames prepared, nothing selected" immediately,
+        # so the buttons are never enabled before a run could work.
+        self.update_tracking_controls()
 
         dino_group, dino_layout = group("Find objects from text")
 
@@ -4094,14 +4290,9 @@ class ImageAnnotator(QMainWindow):
         for annotation in sorted_annotations:
             class_name = annotation["category_name"]
             if not class_name.startswith("Temp-"):  # Only add non-temporary annotations
-                number = annotation.get("number", 0)
-                area = calculate_area(annotation)
-                item_text = f"{class_name} - {number:<3} Area: {area:.2f}"
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.ItemDataRole.UserRole, annotation)
-                color = self.image_label.class_colors.get(class_name, QColor(Qt.GlobalColor.white))
-                item.setForeground(color)
-                self.annotation_list.addItem(item)
+                self.annotation_list.addItem(
+                    self._annotation_list_item(class_name, annotation)
+                )
 
         self.image_label.update()
 
@@ -5051,8 +5242,19 @@ class ImageAnnotator(QMainWindow):
             "Show only frames that have no labels yet — the queue of work left."
         )
         self.unlabeled_only_button.toggled.connect(lambda _: self.apply_frame_filter())
+        # The review queue after a tracking run: the frames a model wrote
+        # to. Without it, checking a 44-frame run means opening all 44.
+        self.ai_only_button = QPushButton("AI")
+        self.ai_only_button.setCheckable(True)
+        self.ai_only_button.setProperty("buttonRole", "ghost")
+        self.ai_only_button.setToolTip(
+            "Show only frames holding a model-generated mask \u2014 the "
+            "queue to review after tracking."
+        )
+        self.ai_only_button.toggled.connect(lambda _: self.apply_frame_filter())
         filter_layout.addWidget(self.frame_filter_edit, 1)
         filter_layout.addWidget(self.unlabeled_only_button)
+        filter_layout.addWidget(self.ai_only_button)
         self.image_list_layout.addWidget(filter_row)
 
         self.image_list = QListWidget()
@@ -5247,6 +5449,15 @@ class ImageAnnotator(QMainWindow):
             if not str(class_name).startswith("Temp-")
         )
 
+    def frame_has_ai_labels(self, frame_name) -> bool:
+        """True when a frame carries a model-generated annotation.
+
+        Mirrors ``frame_has_labels`` so the two frame filters agree about
+        what a frame's annotations are; the difference is only who drew
+        them.
+        """
+        return frame_has_ai_annotations(self.all_annotations.get(frame_name))
+
     def _status_dot(self, color: QColor) -> QIcon:
         """A small filled circle used as the labeled/unlabeled marker.
 
@@ -5318,6 +5529,7 @@ class ImageAnnotator(QMainWindow):
         self._progress_refresh_pending = False
         self.apply_frame_filter()
         self.refresh_frame_progress()
+        self.update_selection_readout()
 
     def refresh_session_status(self):
         """Cheap refresh for navigation: no per-frame work.
@@ -5327,6 +5539,7 @@ class ImageAnnotator(QMainWindow):
         """
         self.update_next_step_hint()
         self._sync_history_buttons()
+        self.update_selection_readout()
         self._update_slice_panel_visibility()
 
     def refresh_slice_markers(self):
@@ -5404,12 +5617,17 @@ class ImageAnnotator(QMainWindow):
             return
         needle = self.frame_filter_edit.text().strip().lower()
         todo_only = self.unlabeled_only_button.isChecked()
+        ai_only = getattr(self, "ai_only_button", None) is not None and (
+            self.ai_only_button.isChecked()
+        )
         hidden = 0
         for index in range(self.image_list.count()):
             item = self.image_list.item(index)
             name = item.text()
             matches = needle in name.lower() if needle else True
             if todo_only and self.frame_has_labels(name):
+                matches = False
+            if ai_only and not self.frame_has_ai_labels(name):
                 matches = False
             # Never hide what is currently open. The list holds stack file
             # names rather than slice names, so this also covers the case
@@ -6277,6 +6495,43 @@ class ImageAnnotator(QMainWindow):
                     ann["number"] = i
         self.update_annotation_list()
 
+    def clear_ai_annotations_on_frame(self):
+        """Drop every model-generated annotation on the frame in view.
+
+        The move a review pass actually needs: SAM 3 got this frame
+        wrong, so take its masks off and draw the polygon by hand. Only
+        model output is removed, so a hand-drawn label already on the
+        frame survives. It is one history step, so Ctrl+Z puts the masks
+        back if the frame turns out to have been fine.
+        """
+        if self._reject_while_sam3_busy():
+            return 0
+        key = self._current_history_key()
+        if not key:
+            return 0
+        frame_annotations = self.all_annotations.get(key) or {}
+        removed = count_ai_annotations(frame_annotations)
+        if not removed:
+            return 0
+
+        self.record_annotation_history("clearing AI masks on this frame", key)
+        kept = {}
+        for class_name, annotations in frame_annotations.items():
+            remaining = [a for a in annotations if not is_ai_generated(a)]
+            if remaining:
+                kept[class_name] = remaining
+
+        self._restore_annotation_state(key, kept)
+        self._sync_history_buttons()
+        self.annotations_changed()
+        self.auto_save()
+        self.statusBar().showMessage(
+            f"Removed {removed} AI mask(s) from this frame \u2014 draw the "
+            "correct polygon, or Ctrl+Z to put them back",
+            6000,
+        )
+        return removed
+
     def delete_selected_annotations(self):
         if self._reject_while_sam3_busy():
             return
@@ -6287,13 +6542,20 @@ class ImageAnnotator(QMainWindow):
             )
             return
 
-        reply = QMessageBox.question(
-            self,
-            "Delete Annotations",
-            f"Are you sure you want to delete {len(selected_items)} annotation(s)?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        # Deleting one polygon is the core move of reviewing a
+        # tracking run, it is recorded in the undo history, and a
+        # confirm dialog on every single one makes that review
+        # unbearable. Deleting several at once is still worth a prompt.
+        if len(selected_items) == 1:
+            reply = QMessageBox.StandardButton.Yes
+        else:
+            reply = QMessageBox.question(
+                self,
+                "Delete Annotations",
+                f"Are you sure you want to delete {len(selected_items)} annotation(s)?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
         if reply == QMessageBox.StandardButton.Yes:
             self.record_annotation_history(
                 f"deleting {len(selected_items)} annotation(s)"
@@ -6326,10 +6588,17 @@ class ImageAnnotator(QMainWindow):
             # Update slice list colors
             self.update_slice_list_colors()
 
-            QMessageBox.information(
-                self,
-                "Annotations Deleted",
-                f"{len(selected_items)} annotation(s) have been deleted.",
+            self.annotation_list.clearSelection()
+            self.annotations_changed()
+            tracked = sum(
+                1 for _, annotation in annotations_to_remove
+                if is_ai_generated(annotation)
+            )
+            note = f" ({tracked} from SAM 3)" if tracked else ""
+            self.statusBar().showMessage(
+                f"Deleted {len(selected_items)} annotation(s){note} "
+                "\u2014 Ctrl+Z to restore",
+                3000,
             )
             self.auto_save()  # Auto-save after deleting annotations
 
@@ -7094,51 +7363,35 @@ class ImageAnnotator(QMainWindow):
                 )
                 return
 
-            # Create a polygon from the current annotation
-            polygon = Polygon(self.image_label.current_annotation)
-
-            # Define the image boundary as a rectangle
-            image_boundary = Polygon(
-                [
-                    (0, 0),
-                    (self.current_image.width(), 0),
-                    (self.current_image.width(), self.current_image.height()),
-                    (0, self.current_image.height()),
-                ]
+            # Repair before clipping: an outline that crosses itself
+            # makes shapely raise, and an unhandled raise in a Qt slot
+            # closes the app.
+            clipped_polygon = clip_drawn_shape(
+                self.image_label.current_annotation,
+                self.current_image.width(),
+                self.current_image.height(),
             )
 
-            # Intersect the polygon with the image boundary
-            clipped_polygon = polygon.intersection(image_boundary)
-
-            if clipped_polygon.is_empty:
+            if clipped_polygon is None:
                 QMessageBox.warning(
                     self,
                     "Invalid Annotation",
-                    "The annotation is completely outside the image boundaries.",
+                    "That outline could not be turned into a shape \u2014 it may "
+                    "cross itself, or lie outside the image. Draw it again "
+                    "without the outline doubling back over its own edge.",
                 )
                 self.image_label.clear_current_annotation()
+                self.image_label.drawing_polygon = False
+                self.image_label.reset_annotation_state()
                 self.image_label.update()
                 return
 
             # Convert the clipped polygon to a segmentation format
-            if isinstance(clipped_polygon, Polygon):
-                segmentation = [
-                    coord
-                    for point in clipped_polygon.exterior.coords
-                    for coord in point
-                ]
-            elif isinstance(clipped_polygon, MultiPolygon):
-                largest_polygon = max(clipped_polygon.geoms, key=lambda p: p.area)
-                segmentation = [
-                    coord
-                    for point in largest_polygon.exterior.coords
-                    for coord in point
-                ]
-            else:
-                QMessageBox.warning(
-                    self, "Invalid Annotation", "The annotation could not be processed."
-                )
-                return
+            segmentation = [
+                coord
+                for point in clipped_polygon.exterior.coords
+                for coord in point
+            ]
 
             self.record_annotation_history("adding a polygon")
             new_annotation = {
@@ -7225,51 +7478,32 @@ class ImageAnnotator(QMainWindow):
         if self.image_label.current_rectangle:
             x1, y1, x2, y2 = self.image_label.current_rectangle
 
-            # Create a rectangle polygon from the annotation
-            rectangle = Polygon([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
-
-            # Define the image boundary as a rectangle
-            image_boundary = Polygon(
-                [
-                    (0, 0),
-                    (self.current_image.width(), 0),
-                    (self.current_image.width(), self.current_image.height()),
-                    (0, self.current_image.height()),
-                ]
+            # Same repair as the polygon path. A box dragged to zero
+            # width or height is a line, not a polygon, and shapely can
+            # raise on it just the same.
+            clipped_rectangle = clip_drawn_shape(
+                [(x1, y1), (x2, y1), (x2, y2), (x1, y2)],
+                self.current_image.width(),
+                self.current_image.height(),
             )
 
-            # Intersect the rectangle with the image boundary
-            clipped_rectangle = rectangle.intersection(image_boundary)
-
-            if clipped_rectangle.is_empty:
+            if clipped_rectangle is None:
                 QMessageBox.warning(
                     self,
                     "Invalid Annotation",
-                    "The annotation is completely outside the image boundaries.",
+                    "That box could not be used \u2014 it has no area, or lies "
+                    "outside the image. Drag it again.",
                 )
                 self.image_label.current_rectangle = None
                 self.image_label.update()
                 return
 
             # Convert the clipped rectangle to a segmentation format
-            if isinstance(clipped_rectangle, Polygon):
-                segmentation = [
-                    coord
-                    for point in clipped_rectangle.exterior.coords
-                    for coord in point
-                ]
-            elif isinstance(clipped_rectangle, MultiPolygon):
-                largest_polygon = max(clipped_rectangle.geoms, key=lambda p: p.area)
-                segmentation = [
-                    coord
-                    for point in largest_polygon.exterior.coords
-                    for coord in point
-                ]
-            else:
-                QMessageBox.warning(
-                    self, "Invalid Annotation", "The annotation could not be processed."
-                )
-                return
+            segmentation = [
+                coord
+                for point in clipped_rectangle.exterior.coords
+                for coord in point
+            ]
 
             self.record_annotation_history("adding a box")
             new_annotation = {
@@ -7321,11 +7555,193 @@ class ImageAnnotator(QMainWindow):
                 break
 
     def select_annotation_in_list(self, annotation):
+        """Select the row for one annotation.
+
+        Qt converts a Python dict on its way through item data, so the
+        object read back is a copy and identity usually fails; the
+        identity pass below is only an opportunistic fast path. What
+        keeps equality matching safe is that a tracked mask carries
+        provenance keys (``source``, ``sam3_source_frame``) that the
+        manual polygon it was seeded from does not, so the two never
+        compare equal even when their geometry is identical — deleting
+        the AI copy can never remove the human one instead.
+        """
+        fallback = None
         for i in range(self.annotation_list.count()):
             item = self.annotation_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == annotation:
-                self.annotation_list.setCurrentItem(item)
-                break
+            stored = item.data(Qt.ItemDataRole.UserRole)
+            if stored is annotation:
+                self._activate_annotation_item(item)
+                return item
+            if fallback is None and stored == annotation:
+                fallback = item
+        if fallback is not None:
+            self._activate_annotation_item(fallback)
+        return fallback
+
+    def _activate_annotation_item(self, item):
+        """Make one row the selection without stealing keyboard focus.
+
+        Focus stays where the click was — usually the canvas — so Delete
+        and the workflow keys keep working straight after selecting.
+        """
+        self.annotation_list.setCurrentItem(item)
+        self.annotation_list.scrollToItem(item)
+        self.update_highlighted_annotations()
+        self.update_selection_readout()
+
+    def update_selection_readout(self):
+        """Keep the panel line and the tracking buttons in step.
+
+        Called from every path that can change either the annotations on
+        the frame or which of them is selected, so the buttons can never
+        claim a selection that is not there.
+        """
+        frame = self.current_slice or self.image_file_name
+        frame_annotations = self.all_annotations.get(frame, {})
+        ai_count = count_ai_annotations(frame_annotations)
+
+        clear_btn = getattr(self, "clear_ai_button", None)
+        if clear_btn is not None:
+            clear_btn.setEnabled(bool(ai_count))
+            clear_btn.setToolTip(
+                f"Remove the {ai_count} model-generated mask(s) on this frame "
+                "and keep your own labels. Shift+Delete does the same; "
+                "Ctrl+Z puts them back."
+                if ai_count
+                else "No model-generated masks on this frame."
+            )
+
+        label = getattr(self, "annotation_selection_label", None)
+        if label is not None:
+            total = sum(
+                len(annotations) for annotations in frame_annotations.values()
+            )
+            selected = self.selected_annotations()
+            if not total:
+                text = "No annotations on this frame"
+            else:
+                plural = "" if total == 1 else "s"
+                text = f"{total} annotation{plural} on this frame"
+                if ai_count:
+                    text += f" \u00b7 {ai_count} from SAM 3"
+                if selected:
+                    tracked = sum(
+                        1 for annotation in selected if is_ai_generated(annotation)
+                    )
+                    text += f" \u00b7 {len(selected)} selected"
+                    if tracked:
+                        text += f" ({tracked} AI)"
+                else:
+                    text += " \u00b7 none selected"
+            label.setText(text)
+        self.update_tracking_controls()
+
+    @staticmethod
+    def _compose_help(description, reason):
+        """Join what a button does with why it is or is not available."""
+        if not description:
+            return reason
+        if not reason:
+            return description
+        return f"{description}\n\n{reason}"
+
+    def _valid_tracking_polygons(self, annotations):
+        """Annotations SAM 3 can actually be seeded from.
+
+        Mirrors the filter inside ``sam3_track_forward``: a polygon needs
+        at least three points. Sharing the rule is what lets the button
+        be disabled for exactly the cases the run would have rejected,
+        instead of enabling it and failing in a dialog.
+        """
+        return [
+            annotation
+            for annotation in annotations
+            if len(annotation.get("segmentation") or []) >= 6
+        ]
+
+    def update_tracking_controls(self):
+        """Enable the track buttons only when a run could succeed."""
+        forward_btn = getattr(self, "sam3_track_forward_btn", None)
+        all_btn = getattr(self, "sam3_track_all_btn", None)
+        if forward_btn is None and all_btn is None:
+            return
+
+        tracker = getattr(self, "sam3_tracker", None)
+        # getattr rather than attribute access: tests inject lightweight
+        # tracker stand-ins, and a refresh that runs on every frame
+        # switch must not depend on one implementing the whole surface.
+        prepared = bool(getattr(tracker, "is_initialized", False))
+        frame = self.current_slice or self.image_file_name
+        frame_annotations = self.all_annotations.get(frame, {})
+        on_frame = [
+            annotation
+            for annotations in frame_annotations.values()
+            for annotation in annotations
+        ]
+        selected_ok = self._valid_tracking_polygons(self.selected_annotations())
+        frame_ok = self._valid_tracking_polygons(on_frame)
+
+        if forward_btn is not None:
+            forward_btn.setEnabled(bool(prepared and selected_ok))
+            if not prepared:
+                reason = "Run \u201c1. Prepare Loaded Frames\u201d first."
+            elif not frame_ok:
+                reason = "Draw a polygon on this frame first."
+            elif not selected_ok:
+                reason = (
+                    "Select a polygon \u2014 click it on the canvas, or in "
+                    "\u201cAnnotations on this frame\u201d. Selecting a row in "
+                    "the Frames list is not the same thing."
+                )
+            else:
+                reason = (
+                    f"Track {len(selected_ok)} selected polygon(s) from this "
+                    "frame to the end of the loaded sequence."
+                )
+            forward_btn.setToolTip(
+                self._compose_help(self._track_forward_help, reason)
+            )
+
+        if all_btn is not None:
+            all_btn.setEnabled(bool(prepared and frame_ok))
+            if not prepared:
+                all_reason = "Run \u201c1. Prepare Loaded Frames\u201d first."
+            elif not frame_ok:
+                all_reason = "Draw a polygon on this frame first."
+            else:
+                all_reason = (
+                    f"Ready: {len(frame_ok)} polygon(s) on this frame."
+                )
+            all_btn.setToolTip(
+                self._compose_help(self._track_all_help, all_reason)
+            )
+
+    def has_annotation_selection(self):
+        """True when at least one annotation row is selected."""
+        return bool(
+            getattr(self, "annotation_list", None)
+            and self.annotation_list.selectedItems()
+        )
+
+    def selected_annotations(self):
+        """The annotation dicts behind the current selection."""
+        if not getattr(self, "annotation_list", None):
+            return []
+        return [
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self.annotation_list.selectedItems()
+        ]
+
+    def clear_annotation_selection(self):
+        """Drop the annotation selection and its canvas highlight."""
+        if not getattr(self, "annotation_list", None):
+            return
+        self.annotation_list.clearSelection()
+        self.annotation_list.setCurrentItem(None)
+        self.image_label.highlighted_annotations.clear()
+        self.image_label.update()
+        self.update_selection_readout()
 
     ################################################################
 
@@ -8213,6 +8629,18 @@ class ImageAnnotator(QMainWindow):
         if frame_name in recorded:
             return
         recorded.add(frame_name)
+        # Keep our own copy of the pre-run state as well. The per-frame
+        # history stack is the right structure for Ctrl+Z on one frame,
+        # but rolling a whole run back has to restore frames the user is
+        # not looking at, and popping another frame's stack from here
+        # would leave its redo branch inconsistent.
+        snapshots = getattr(self, "_sam3_run_snapshots", None)
+        if snapshots is None:
+            snapshots = self._sam3_run_snapshots = {}
+        if frame_name not in snapshots:
+            snapshots[frame_name] = self.annotation_history.snapshot(
+                self.all_annotations.get(frame_name)
+            )
         self.record_annotation_history("SAM 3 tracking", frame_name)
 
     def open_frame_folder(self):
@@ -8683,6 +9111,7 @@ class ImageAnnotator(QMainWindow):
                 str(self._sam3_frame_workspace),
             )
             frame_count = len(self.frame_sequence.frames)
+            self.update_tracking_controls()
             self.show_info(
                 "SAM 3 Tracker",
                 f"Prepared {frame_count} loaded frame(s). Draw or select a polygon "
@@ -8782,10 +9211,34 @@ class ImageAnnotator(QMainWindow):
             self.show_warning("Tracking", message)
             return
 
+        max_frame_gap = self.sam3_max_frame_gap.value()
+        run_end_idx = self.frame_sequence.end_index_for_max_gap(
+            current_idx, max_frame_gap
+        )
+        following_name = self.frame_sequence.name_for_index(run_end_idx + 1)
+        source_gap = self.frame_sequence.source_gap_after(run_end_idx)
+        if run_end_idx == current_idx:
+            if following_name:
+                self.show_info(
+                    "Manual Mask Needed",
+                    f"The next image is {source_gap} source frames away. "
+                    f"Moved to {following_name}. Draw a new polygon there, "
+                    "then track nearby again.",
+                )
+                self._navigate_to_image_or_slice(following_name)
+            else:
+                self.show_warning(
+                    "Tracking",
+                    "There are no nearby later frames to track from this image.",
+                )
+            return
+
         next_name = None
+        reached_gap = False
         # One undo step per frame for the whole run — the clear below and
         # the write loop both reach the same frames.
         self._sam3_history_recorded = set()
+        self._sam3_run_snapshots = {}
         try:
             self._sam3_inference_in_flight = True
             self.setCursor(Qt.CursorShape.WaitCursor)
@@ -8796,12 +9249,13 @@ class ImageAnnotator(QMainWindow):
                 current_idx,
                 object_polygons,
                 frame_size,
+                run_end_idx - current_idx,
             )
             self._clear_sam3_tracks_from_sources(
                 current_image_name, objects_to_track
             )
             for out_frame_idx, segmentations_by_object in results:
-                if out_frame_idx == current_idx:
+                if out_frame_idx == current_idx or out_frame_idx > run_end_idx:
                     continue
                 frame_name = self.frame_sequence.name_for_index(out_frame_idx)
                 if not frame_name:
@@ -8848,6 +9302,19 @@ class ImageAnnotator(QMainWindow):
             # the last frame.
             self.annotations_changed()
             self.image_label.update()
+            run_report = getattr(self.sam3_tracker, "last_run_report", None) or {}
+            reached_gap = bool(following_name) and any(
+                info.get("last_frame") == run_end_idx
+                for info in run_report.values()
+            )
+            if reached_gap:
+                for info in run_report.values():
+                    if info.get("last_frame") == run_end_idx and not info.get("stopped"):
+                        info["stopped"] = (
+                            f"the next image is {source_gap} source frames away; "
+                            "a new manual mask is needed"
+                        )
+            self._report_tracking_run(objects_to_track, tracked_annotation_count)
             if tracked_annotation_count:
                 if not saved:
                     self.show_warning(
@@ -8857,8 +9324,17 @@ class ImageAnnotator(QMainWindow):
                         "project before navigating away.",
                     )
                     return
-                next_name = self.frame_sequence.name_for_index(current_idx + 1)
-                if any(
+                if reached_gap:
+                    next_name = following_name
+                    self.show_info(
+                        "Manual Mask Needed",
+                        f"Finished the nearby run. The next image is {source_gap} "
+                        f"source frames away, so SAM 3 stopped at the gap. Draw a "
+                        f"new polygon on {following_name}, then track nearby again.",
+                    )
+                else:
+                    next_name = self.frame_sequence.name_for_index(current_idx + 1)
+                if not reached_gap and any(
                     class_name == "droplet"
                     for class_name, _ in objects_to_track.values()
                 ):
@@ -8884,6 +9360,56 @@ class ImageAnnotator(QMainWindow):
             self.setCursor(Qt.CursorShape.ArrowCursor)
         if next_name:
             self._navigate_to_image_or_slice(next_name)
+
+    def _report_tracking_run(self, objects_to_track, added):
+        """Say what the run did, including where it met your own labels.
+
+        Nothing was overwritten \u2014 tracked masks are appended \u2014 so this
+        is a report rather than a warning. What matters for a review
+        pass is which frames now hold both a hand-drawn polygon and a
+        model one for the same class, because those are the frames where
+        a duplicate can quietly reach an export.
+        """
+        snapshots = self._sam3_run_snapshots
+        if not snapshots:
+            return
+        tracked_classes = {class_name for class_name, _ in objects_to_track.values()}
+        overlapping = sum(
+            1
+            for snapshot in snapshots.values()
+            if manual_classes(snapshot) & tracked_classes
+        )
+        message = f"SAM 3 wrote {added} mask(s) across {len(snapshots)} frame(s)"
+        if overlapping:
+            message += (
+                f" \u00b7 {overlapping} already had your own label for the same "
+                "class, so both are now on those frames"
+            )
+        for note in self._tracking_stop_notes(objects_to_track):
+            message += f" \u00b7 {note}"
+        message += " \u00b7 review with the AI filter; Delete removes a bad mask"
+        self.statusBar().showMessage(message, 20000)
+
+    def _tracking_stop_notes(self, objects_to_track):
+        """Why each object stopped, in the words the tracker recorded.
+
+        A run that ends after nine frames of a sixty-frame clip used to
+        say nothing at all, so the only way to find out whether that was
+        the object leaving the frame or a gate being too strict was to
+        read the source. Re-seeding from the last good frame is the fix
+        for most of them, and that is only obvious once the reason is.
+        """
+        report = getattr(self.sam3_tracker, "last_run_report", None) or {}
+        notes = []
+        for object_id, info in report.items():
+            if not info.get("stopped"):
+                continue
+            class_name = (objects_to_track.get(object_id) or ("object", None))[0]
+            notes.append(
+                f"{class_name} stopped after {info['frames']} frame(s) \u2014 "
+                f"{info['stopped']}"
+            )
+        return notes
 
     def remove_all_temp_annotations(self):
         for image_name in list(self.all_annotations.keys()):

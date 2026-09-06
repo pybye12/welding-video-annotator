@@ -32,6 +32,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
+from .annotation_source import is_ai_generated
 from .display_adjustments import adjust_qimage
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -748,7 +749,18 @@ class ImageLabel(QLabel):
                 fill_color.setAlphaF(self.fill_opacity)
 
                 text_color = Qt.GlobalColor.white if self.dark_mode else Qt.GlobalColor.black
-                painter.setPen(QPen(border_color, 2 / self.zoom_factor, Qt.PenStyle.SolidLine))
+                # A model-generated mask is a suggestion, not ground
+                # truth. Dashing its outline is the only cue that
+                # survives zooming, panning and a colour-blind reviewer,
+                # and it costs nothing on the drawing path.
+                outline_style = (
+                    Qt.PenStyle.DashLine
+                    if is_ai_generated(annotation)
+                    else Qt.PenStyle.SolidLine
+                )
+                painter.setPen(
+                    QPen(border_color, 2 / self.zoom_factor, outline_style)
+                )
                 painter.setBrush(QBrush(fill_color))
 
                 if "segmentation" in annotation:
@@ -997,6 +1009,13 @@ class ImageLabel(QLabel):
                 self.start_painting(pos)
             elif self.current_tool == "eraser":
                 self.start_erasing(pos)
+            else:
+                # No tool armed: a plain click picks the polygon under
+                # the cursor. Double-click still opens vertex editing;
+                # this only changes the selection, so reviewing a
+                # tracking run is click, look, Delete — without being
+                # dropped into an edit mode nobody asked for.
+                self.select_annotation_at(pos)
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -1156,13 +1175,20 @@ class ImageLabel(QLabel):
                 self.discard_eraser_changes()
             else:
                 self.cancel_current_annotation()
-        elif event.key() == Qt.Key.Key_Delete:
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            # Backspace is what most people reach for, and previously
+            # only Delete was bound — and only while a polygon was open
+            # for vertex editing. A polygon selected by clicking it now
+            # deletes too, which is the whole point of a review pass.
             if self.editing_polygon:
                 self.main_window.delete_selected_annotations()
                 self.editing_polygon = None
                 self.editing_point_index = None
                 self.hover_point_index = None
                 self.main_window.enable_tools()
+                self.update()
+            elif self.main_window and self.main_window.has_annotation_selection():
+                self.main_window.delete_selected_annotations()
                 self.update()
         elif event.key() == Qt.Key.Key_Minus:
             if self.current_tool == "paint_brush":
@@ -1202,6 +1228,44 @@ class ImageLabel(QLabel):
             self.drawing_polygon = False
             if self.main_window:
                 self.main_window.finish_polygon()
+
+    def annotation_at(self, pos):
+        """Topmost visible annotation containing an image-space point."""
+        for class_name, annotations in reversed(list(self.annotations.items())):
+            if self.main_window and not self.main_window.is_class_visible(
+                class_name
+            ):
+                continue
+            for annotation in reversed(annotations):
+                if "segmentation" not in annotation:
+                    continue
+                points = [
+                    QPoint(int(x), int(y))
+                    for x, y in zip(
+                        annotation["segmentation"][0::2],
+                        annotation["segmentation"][1::2],
+                    )
+                ]
+                if points and self.point_in_polygon(pos, points):
+                    return annotation
+        return None
+
+    def select_annotation_at(self, pos):
+        """Select the polygon under ``pos`` in the annotation list.
+
+        Returns the annotation, or None when the click landed on empty
+        image. Clicking empty image clears the selection, which is what
+        makes "nothing is selected" a state the user can reach on
+        purpose rather than only by accident.
+        """
+        annotation = self.annotation_at(pos)
+        if not self.main_window:
+            return annotation
+        if annotation is None:
+            self.main_window.clear_annotation_selection()
+        else:
+            self.main_window.select_annotation_in_list(annotation)
+        return annotation
 
     def start_polygon_edit(self, pos):
         for class_name, annotations in self.annotations.items():

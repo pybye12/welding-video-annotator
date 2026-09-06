@@ -1,7 +1,7 @@
 """The keyboard reference, in one place.
 
 The shortcuts were previously spread across tooltips, the help window and
-CLAUDE.md, so a new lab member had no single place to look them up. This
+developer notes, so a new lab member had no single place to look them up. This
 module is the complete list, rendered by ``ShortcutReferenceDialog``
 (Help > Keyboard Shortcuts, or Ctrl+/).
 
@@ -48,6 +48,11 @@ SHORTCUT_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Enter", "Finish the polygon, or accept proposed masks"),
             ("Esc", "Cancel the current shape, or reject proposed masks"),
             ("Delete", "Delete the selected annotations"),
+            ("Backspace", "Delete the selected annotations"),
+            (
+                "Shift+Delete",
+                "Remove every AI mask on this frame, keeping your own labels",
+            ),
             ("- / =", "Brush or eraser size"),
         ],
     ),
